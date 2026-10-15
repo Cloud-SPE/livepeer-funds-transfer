@@ -1,17 +1,20 @@
 [package]
 name = "livepeer-funds-transfer"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 publish = false
 
 [dependencies]
 # Framework Level Deps
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
 dotenv = "0.15.0"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 
-tracing = "0.1.43"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Etherium Deps
 ethers = { version = "2.0.14", features = ["rustls"] }
+
+[dev-dependencies]
+proptest = "1.12.0"

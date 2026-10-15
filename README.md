@@ -11,6 +11,7 @@ A Rust-based automated service for managing Livepeer Protocol token (LPT) stakin
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Building](#building)
+- [Testing](#testing)
 - [Running](#running)
 - [Docker Deployment](#docker-deployment)
 - [Operations](#operations)
@@ -23,7 +24,7 @@ This service automates Livepeer orchestrator operations by monitoring the Livepe
 
 The application performs the following tasks:
 
-1. **Reward Claiming**: Calls `reward()` exactly once per round when a new round is initialized
+1. **Reward Claiming**: Calls `rewardWithHint()` exactly once per round when a new round is initialized
 2. **Bond Transfer**: Transfers bonded LPT from the orchestrator wallet once the round is locked, while retaining a minimum bonded balance
 3. **Fee Withdrawal**: Withdraws accumulated ETH fees when they exceed a configurable threshold
 
@@ -40,9 +41,16 @@ livepeer-funds-transfer/
 ├── src/
 │   ├── bin/
 │   │   └── funds_transfer.rs    # Main application logic
-│   └── abi/
-│       ├── BondingManager.json  # Livepeer BondingManager contract ABI
-│       └── RoundsManager.json   # Livepeer RoundsManager contract ABI
+│   ├── lib.rs
+│   ├── contracts.rs             # abigen bindings
+│   ├── reward_hints.rs          # rewardWithHint position hints + reward math
+│   └── abi/                     # From livepeer/protocol deployments/arbitrumMainnet
+│       ├── BondingManager.json
+│       ├── Controller.json
+│       ├── Minter.json
+│       └── RoundsManager.json
+├── tests/
+│   └── reward_hints_fork.rs     # Arbitrum fork test (anvil)
 └── README.md
 ```
 
@@ -64,7 +72,8 @@ The application interacts with two Livepeer Protocol smart contracts on Arbitrum
 
 ## Features
 
-- **Round-Aware Rewarding**: Calls `reward()` once per initialized round using on-chain state to prevent duplicates
+- **Round-Aware Rewarding**: Calls `rewardWithHint()` once per initialized round using on-chain state to prevent duplicates
+- **Reward Hints**: Computes the orchestrator's new position in the transcoder pool so the contract skips its linear search (see [Reward Hints](#reward-hints))
 - **Automated LPT Transfer**: Transfers all excess bonded LPT while retaining a minimum bonded amount on the orchestrator
 - **Fee Management**: Withdraws accumulated ETH fees above a configurable threshold
 - **Round Safety**: Bond transfers and fee withdrawals only occur when the round is locked
@@ -184,13 +193,19 @@ LOOP_SLEEP_SECS=60
 All operational parameters are configurable via environment variables:
 
 - **LPT_MIN_RETAIN_WEI**  
-  Minimum bonded LPT that must remain on the orchestrator after transfers.
+  Minimum bonded LPT that must remain on the orchestrator after transfers. An empty value is rejected at startup (it would otherwise read as 0 and transfer the entire stake); set `"0"` explicitly if that is really intended.
 
 - **ETH_FEE_WITHDRAW_THRESHOLD_WEI**  
   ETH fees must meet or exceed this value before withdrawal.
 
 - **LOOP_SLEEP_SECS**  
   Polling interval. Failed actions are retried on the next loop iteration.
+
+- **MAX_FEE_BASE_MULTIPLIER** (default `2`)  
+  Transactions are sent with `maxFeePerGas = baseFee * MAX_FEE_BASE_MULTIPLIER + MAX_PRIORITY_FEE_WEI`, using the latest block's base fee. Raise it if transactions sit pending during base-fee spikes.
+
+- **MAX_PRIORITY_FEE_WEI** (default `0`)  
+  Priority fee (tip). Arbitrum does not pay tips to the sequencer, so `0` is normally correct.
 
 These values can be adjusted without rebuilding the application.
 
@@ -221,6 +236,24 @@ cargo build --all-features
 # Check for compilation errors without building
 cargo check
 ```
+
+## Testing
+
+```bash
+# Unit + property tests (offline)
+cargo test
+
+# Fork test: sends real rewardWithHint txs for every active orchestrator on an
+# anvil fork of Arbitrum and checks each lands exactly at the hinted position
+# with the predicted reward. Needs Foundry's anvil and network access; ~30 min
+# for the full pool. The public RPC may prune the fork block's state before a full
+# run ends; use an archive RPC or split it with FORK_TEST_SKIP / FORK_TEST_LIMIT.
+cargo test --test reward_hints_fork -- --ignored --nocapture
+FORK_TEST_LIMIT=10 ARB_RPC_URL=https://your-rpc cargo test --test reward_hints_fork -- --ignored --nocapture
+```
+
+The unit tests pin the reward math to real mainnet `Reward` events, and a property
+test checks that hints always satisfy `SortedDoublyLL.validInsertPosition` on random pools.
 
 ## Running
 
@@ -256,7 +289,7 @@ The application operates in a continuous loop:
    - Whether the round is initialized
    - Whether the round is locked
 3. If the round is initialized:
-   - Calls `reward()` once per round if it has not already been called
+   - Calls `rewardWithHint()` once per round if it has not already been called
 4. If the round is locked:
    - Transfers bonded LPT in excess of `LPT_MIN_RETAIN_WEI`
    - Withdraws ETH fees if they exceed the configured threshold
@@ -380,6 +413,26 @@ Monitor for:
 2025-12-20T18:29:40.529429Z  INFO funds_transfer: withdrawFees confirmed: round=4035 tx_hash=0x93eec... status=Some(1) block=Some(412709684) gas_used=Some(153100)
 ```
 
+### Reward Hints
+
+The transcoder pool is a linked list sorted by stake. `reward()` re-inserts the
+orchestrator with its new stake by walking the list from the top; `rewardWithHint(prev, next)`
+skips the walk when given the correct neighbours. Before each reward the app:
+
+1. Predicts the reward exactly as the contracts do: `Minter.currentMintableTokens` ×
+   the orchestrator's earnings-pool stake ÷ `currentRoundTotalActiveStake` (MathUtilsV2,
+   1e9 precision), minus `treasuryRewardCutRate`
+2. Walks the pool from the head until it reaches the first orchestrator with less stake
+   than `currentStake + reward`
+3. Logs `reward hints: prev=… next=… stakeWei=… expectedRewardWei=…` and sends `rewardWithHint`
+
+Stale or wrong hints never cause a revert; the contract falls back to searching from
+them. If computing hints fails, the app sends `rewardWithHint(0x0, 0x0)`, which is
+identical to `reward()`. Savings grow with pool depth. Measured on an Arbitrum fork
+across all 100 pool positions: ~4% gas for the top 10, ~30% for positions 30–59, ~43%
+for 60–87 and ~49% for the bottom 12 (≈1.02M → ≈515k gas); 33% overall. With hints, gas
+stays at ~490–550k regardless of position.
+
 ## Security Considerations
 
 ### Key Management
@@ -427,7 +480,7 @@ Monitor for:
 
 1. **Contract Addresses**: The hardcoded Livepeer contract addresses are for Arbitrum mainnet. Verify these before deployment.
 2. **Protocol Upgrades**: Monitor Livepeer governance for protocol upgrades that might affect these addresses
-3. **Gas Prices**: The application uses default gas estimation - monitor for failed transactions during high network congestion
+3. **Gas Prices**: Fees are derived from the latest base fee (see `MAX_FEE_BASE_MULTIPLIER`); gas limits come from `eth_estimateGas`
 
 ## Troubleshooting
 
@@ -461,7 +514,13 @@ export HTTP_RPC_URL=https://arb1.arbitrum.io/rpc
 - Confirm recipient address is valid
 - Review logs for specific error messages
 
-#### 4. Connection timeouts
+#### 4. "gas required exceeds allowance"
+**Cause**: `eth_estimateGas` caps gas at `walletBalance / maxFeePerGas`. Versions up to 0.0.5 used ethers' mainnet fee defaults (a 3 gwei minimum tip), which is ~100x the Arbitrum base fee, so a wallet holding less than ~0.003 ETH could not estimate `reward()` (~700k–900k gas).
+**Solution**: 
+- Upgrade to a version that prices fees from the base fee (`MAX_FEE_BASE_MULTIPLIER`)
+- Keep a small ETH buffer on the orchestrator wallet for gas
+
+#### 5. Connection timeouts
 **Cause**: RPC endpoint unreachable or rate limited
 **Solution**:
 - Try alternative RPC endpoint
