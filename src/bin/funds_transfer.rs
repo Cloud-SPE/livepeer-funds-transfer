@@ -1,81 +1,23 @@
-use std::{env, fmt, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use ethers::{
-    contract::abigen,
+    contract::ContractCall,
     middleware::SignerMiddleware,
     providers::{Http, Middleware, Provider},
     signers::{LocalWallet, Signer},
-    types::{Address, TxHash, U256},
+    types::{Address, BlockNumber, TxHash, U256, transaction::eip2718::TypedTransaction},
+};
+use livepeer_funds_transfer::{
+    config::{AppError, Config, load_config, validate_config},
+    contracts::{BondingManager, RoundsManager},
+    reward_hints::compute_reward_hints,
 };
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
-abigen!(
-    BondingManager,
-    "src/abi/BondingManager.json",
-    event_derives(serde::Deserialize, serde::Serialize)
-);
-
-abigen!(
-    RoundsManager,
-    "src/abi/RoundsManager.json",
-    event_derives(serde::Deserialize, serde::Serialize)
-);
-#[derive(Clone, Debug)]
-struct Config {
-    http_rpc_url: String,
-    chain_id: u64,
-
-    rounds_manager_addr: Address,
-    bonding_manager_addr: Address,
-
-    json_key_file: String,
-    passphrase_file: String,
-    orchestrator_addr: Option<Address>,
-
-    // Loop timing
-    loop_sleep_secs: u64,
-    // Tx receipt wait timeout
-    receipt_timeout_secs: u64,
-
-    // Reward call (optional)
-    enable_reward: bool,
-
-    // Bond transfer (optional)
-    enable_transfer_bond: bool,
-    lpt_receiver_addr: Option<Address>,
-    lpt_min_retain_wei: Option<U256>,
-
-    // Fee withdrawal (optional)
-    enable_withdraw_fees: bool,
-    eth_fee_receiver_addr: Option<Address>,
-    eth_fee_withdraw_threshold_wei: Option<U256>,
-}
-
-#[derive(Debug)]
-enum AppError {
-    MissingEnv(&'static str),
-    BadEnv(&'static str, String),
-    Provider(String),
-    Wallet(String),
-    Contract(String),
-    Tx(String),
-}
-
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AppError::MissingEnv(k) => write!(f, "missing env var: {k}"),
-            AppError::BadEnv(k, v) => write!(f, "invalid env var {k}: {v}"),
-            AppError::Provider(e) => write!(f, "provider error: {e}"),
-            AppError::Wallet(e) => write!(f, "wallet error: {e}"),
-            AppError::Contract(e) => write!(f, "contract error: {e}"),
-            AppError::Tx(e) => write!(f, "tx error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for AppError {}
+#[cfg(test)]
+#[path = "funds_transfer/tests.rs"]
+mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RoundState {
@@ -146,61 +88,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_locked_snapshot: Option<LockedSnapshot> = None;
 
     loop {
-        let state = match fetch_round_state(&rounds).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("failed to fetch round state: {e}; will retry next loop");
-                sleep(Duration::from_secs(cfg.loop_sleep_secs)).await;
-                continue;
-            }
-        };
-
-        let state_changed = last_state.map(|ls| ls != state).unwrap_or(true);
-        if state_changed {
-            info!(
-                "round state changed: round={} initialized={} locked={}",
-                state.round, state.initialized, state.locked
-            );
-        } else {
-            debug!(
-                "round unchanged: round={} initialized={} locked={}",
-                state.round, state.initialized, state.locked
-            );
-        }
-
-        // 1) When initialized: reward() once per round
-        if cfg.enable_reward && state.initialized {
-            if let Err(e) = maybe_reward_once_per_round(
-                &bonding,
-                orchestrator_addr,
-                state.round,
-                cfg.receipt_timeout_secs,
-            )
-            .await
-            {
-                // no internal retries: next loop will re-check and retry if still needed
-                warn!("reward check/tx failed: {e}; will retry next loop if still needed");
-            }
-        }
-
-        // 2) When locked: transferBond + withdrawFees
-        if (cfg.enable_transfer_bond || cfg.enable_withdraw_fees) && state.locked {
-            if let Err(e) = handle_locked_round_actions(
-                &bonding,
-                orchestrator_addr,
-                state.round,
-                &cfg,
-                &mut last_locked_snapshot,
-            )
-            .await
-            {
-                warn!("locked-round actions failed: {e}; will retry next loop if still needed");
-            }
-        }
-
-        last_state = Some(state);
+        poll_once(
+            &rounds,
+            &bonding,
+            orchestrator_addr,
+            &cfg,
+            &mut last_state,
+            &mut last_locked_snapshot,
+        )
+        .await;
         sleep(Duration::from_secs(cfg.loop_sleep_secs)).await;
     }
+}
+
+/// One iteration of the main loop: read the round state, then run whatever actions it calls
+/// for. Errors are logged, never returned; the next iteration re-checks and retries.
+async fn poll_once<M: Middleware>(
+    rounds: &RoundsManager<M>,
+    bonding: &BondingManager<M>,
+    orchestrator_addr: Address,
+    cfg: &Config,
+    last_state: &mut Option<RoundState>,
+    last_locked_snapshot: &mut Option<LockedSnapshot>,
+) {
+    let state = match fetch_round_state(rounds).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("failed to fetch round state: {e}; will retry next loop");
+            return;
+        }
+    };
+
+    let state_changed = last_state.map(|ls| ls != state).unwrap_or(true);
+    if state_changed {
+        info!(
+            "round state changed: round={} initialized={} locked={}",
+            state.round, state.initialized, state.locked
+        );
+    } else {
+        debug!(
+            "round unchanged: round={} initialized={} locked={}",
+            state.round, state.initialized, state.locked
+        );
+    }
+
+    // 1) When initialized: reward() once per round
+    if cfg.enable_reward
+        && state.initialized
+        && let Err(e) =
+            maybe_reward_once_per_round(bonding, orchestrator_addr, state.round, cfg).await
+    {
+        // no internal retries: next loop will re-check and retry if still needed
+        warn!("reward check/tx failed: {e}; will retry next loop if still needed");
+    }
+
+    // 2) When locked: transferBond + withdrawFees
+    if (cfg.enable_transfer_bond || cfg.enable_withdraw_fees)
+        && state.locked
+        && let Err(e) = handle_locked_round_actions(
+            bonding,
+            orchestrator_addr,
+            state.round,
+            cfg,
+            last_locked_snapshot,
+        )
+        .await
+    {
+        warn!("locked-round actions failed: {e}; will retry next loop if still needed");
+    }
+
+    *last_state = Some(state);
 }
 
 async fn fetch_round_state<M: Middleware>(
@@ -233,14 +190,15 @@ async fn fetch_round_state<M: Middleware>(
     })
 }
 
-/// Calls bonding.reward() ONLY if lastRewardRound < current_round.
+/// Calls bonding.rewardWithHint() ONLY if lastRewardRound < current_round.
 /// No internal retries: if tx fails, caller logs and next loop will retry.
 async fn maybe_reward_once_per_round<M: Middleware>(
     bonding: &BondingManager<M>,
     orchestrator: Address,
     current_round: U256,
-    receipt_timeout_secs: u64,
+    cfg: &Config,
 ) -> Result<(), AppError> {
+    let receipt_timeout_secs = cfg.receipt_timeout_secs;
     // getTranscoder(addr) returns a tuple whose first element is lastRewardRound (per ABI)
     let t = bonding
         .get_transcoder(orchestrator)
@@ -263,11 +221,31 @@ async fn maybe_reward_once_per_round<M: Middleware>(
         last_reward_round, current_round
     );
 
-    let call = bonding.reward();
+    // Hints only save gas; zero hints make rewardWithHint behave exactly like reward().
+    let (prev, next) = match compute_reward_hints(bonding, orchestrator, current_round).await {
+        Ok(h) => {
+            info!(
+                "reward hints: prev={:?} next={:?} stakeWei={} expectedRewardWei={}",
+                h.prev, h.next, h.current_stake, h.expected_reward
+            );
+            (h.prev, h.next)
+        }
+        Err(e) => {
+            warn!("reward hint computation failed: {e}; sending rewardWithHint without hints");
+            (Address::zero(), Address::zero())
+        }
+    };
+
+    let call = with_l2_fees(
+        bonding.client_ref(),
+        bonding.reward_with_hint(prev, next),
+        cfg,
+    )
+    .await?;
     let pending = call
         .send()
         .await
-        .map_err(|e| AppError::Tx(format!("reward() send failed: {e}")))?;
+        .map_err(|e| AppError::Tx(format!("rewardWithHint() send failed: {e}")))?;
 
     let tx_hash: TxHash = *pending;
     info!("reward tx sent: tx_hash={:?}", tx_hash);
@@ -294,6 +272,42 @@ async fn maybe_reward_once_per_round<M: Middleware>(
             receipt_timeout_secs, tx_hash
         ))),
     }
+}
+
+/// Sets EIP-1559 fees from the latest base fee instead of ethers' default estimator.
+///
+/// ethers assumes Ethereum mainnet and uses a minimum 3 gwei tip, which on Arbitrum
+/// (base fee ~0.01 gwei) inflates maxFeePerGas by 100x+. eth_estimateGas caps gas at
+/// balance / maxFeePerGas, so a modestly funded wallet intermittently fails with
+/// "gas required exceeds allowance". Arbitrum ignores the tip, so a zero tip is fine.
+async fn with_l2_fees<M: Middleware, D>(
+    client: &M,
+    mut call: ContractCall<M, D>,
+    cfg: &Config,
+) -> Result<ContractCall<M, D>, AppError> {
+    let block = client
+        .get_block(BlockNumber::Latest)
+        .await
+        .map_err(|e| AppError::Provider(format!("get_block(latest) failed: {e}")))?
+        .ok_or_else(|| AppError::Provider("latest block not found".into()))?;
+    let base_fee = block
+        .base_fee_per_gas
+        .ok_or_else(|| AppError::Provider("latest block has no baseFeePerGas".into()))?;
+
+    let priority_fee = cfg.max_priority_fee_wei;
+    let max_fee = base_fee * U256::from(cfg.max_fee_base_multiplier) + priority_fee;
+
+    if let TypedTransaction::Eip1559(ref mut inner) = call.tx {
+        inner.max_fee_per_gas = Some(max_fee);
+        inner.max_priority_fee_per_gas = Some(priority_fee);
+    }
+
+    debug!(
+        "tx fees: baseFeeWei={} maxFeePerGasWei={} maxPriorityFeePerGasWei={}",
+        base_fee, max_fee, priority_fee
+    );
+
+    Ok(call)
 }
 
 async fn handle_locked_round_actions<M: Middleware>(
@@ -359,14 +373,19 @@ async fn handle_locked_round_actions<M: Middleware>(
                 current_round, orchestrator, receiver, transferable
             );
 
-            let call = bonding.transfer_bond(
-                receiver,
-                transferable,
-                Address::zero(),
-                Address::zero(),
-                Address::zero(),
-                Address::zero(),
-            );
+            let call = with_l2_fees(
+                bonding.client_ref(),
+                bonding.transfer_bond(
+                    receiver,
+                    transferable,
+                    Address::zero(),
+                    Address::zero(),
+                    Address::zero(),
+                    Address::zero(),
+                ),
+                cfg,
+            )
+            .await?;
 
             match call.send().await {
                 Ok(pending) => {
@@ -453,7 +472,12 @@ async fn handle_locked_round_actions<M: Middleware>(
                 current_round, orchestrator, receiver, pending_fees
             );
 
-            let call = bonding.withdraw_fees(receiver, pending_fees);
+            let call = with_l2_fees(
+                bonding.client_ref(),
+                bonding.withdraw_fees(receiver, pending_fees),
+                cfg,
+            )
+            .await?;
 
             match call.send().await {
                 Ok(pending) => {
@@ -556,160 +580,4 @@ fn init_logging() {
     };
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-fn validate_config(cfg: &Config) -> Result<(), AppError> {
-    if cfg.enable_transfer_bond {
-        if cfg.lpt_receiver_addr.is_none() {
-            return Err(AppError::BadEnv(
-                "LPT_RECEIVER_ADDR",
-                "required when ENABLE_TRANSFER_BOND=true".into(),
-            ));
-        }
-        if cfg.lpt_min_retain_wei.is_none() {
-            return Err(AppError::BadEnv(
-                "LPT_MIN_RETAIN_WEI",
-                "required when ENABLE_TRANSFER_BOND=true".into(),
-            ));
-        }
-    }
-
-    if cfg.enable_withdraw_fees {
-        if cfg.eth_fee_receiver_addr.is_none() {
-            return Err(AppError::BadEnv(
-                "ETH_FEE_RECEIVER_ADDR",
-                "required when ENABLE_WITHDRAW_FEES=true".into(),
-            ));
-        }
-        if cfg.eth_fee_withdraw_threshold_wei.is_none() {
-            return Err(AppError::BadEnv(
-                "ETH_FEE_WITHDRAW_THRESHOLD_WEI",
-                "required when ENABLE_WITHDRAW_FEES=true".into(),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn load_config() -> Result<Config, AppError> {
-    // feature flags: default to current behavior (enabled) if not specified
-    let enable_reward = parse_env_bool_opt("ENABLE_REWARD")?.unwrap_or(true);
-    let enable_transfer_bond = parse_env_bool_opt("ENABLE_TRANSFER_BOND")?.unwrap_or(true);
-    let enable_withdraw_fees = parse_env_bool_opt("ENABLE_WITHDRAW_FEES")?.unwrap_or(true);
-
-    let http_rpc_url = must_env("HTTP_RPC_URL")?;
-    let chain_id = must_parse_env_u64("CHAIN_ID")?;
-
-    let rounds_manager_addr = must_parse_env_addr("ROUNDS_MANAGER_ADDR")?;
-    let bonding_manager_addr = must_parse_env_addr("BONDING_MANAGER_ADDR")?;
-
-    let json_key_file = must_env("JSON_KEY_FILE")?;
-    let passphrase_file = must_env("PASSPHRASE_FILE")?;
-    let orchestrator_addr = parse_env_addr_opt("ORCHESTRATOR_ADDR")?;
-
-    let loop_sleep_secs = parse_env_u64_opt("LOOP_SLEEP_SECS")?.unwrap_or(6);
-    let receipt_timeout_secs = parse_env_u64_opt("RECEIPT_TIMEOUT_SECS")?.unwrap_or(90);
-
-    let (lpt_receiver_addr, lpt_min_retain_wei) = if enable_transfer_bond {
-        (
-            Some(must_parse_env_addr("LPT_RECEIVER_ADDR")?),
-            Some(must_parse_env_u256("LPT_MIN_RETAIN_WEI")?),
-        )
-    } else {
-        (None, None)
-    };
-
-    let (eth_fee_receiver_addr, eth_fee_withdraw_threshold_wei) = if enable_withdraw_fees {
-        (
-            Some(must_parse_env_addr("ETH_FEE_RECEIVER_ADDR")?),
-            Some(must_parse_env_u256("ETH_FEE_WITHDRAW_THRESHOLD_WEI")?),
-        )
-    } else {
-        (None, None)
-    };
-
-    Ok(Config {
-        http_rpc_url,
-        chain_id,
-        rounds_manager_addr,
-        bonding_manager_addr,
-        json_key_file,
-        passphrase_file,
-        orchestrator_addr,
-        loop_sleep_secs,
-        receipt_timeout_secs,
-        enable_reward,
-        enable_transfer_bond,
-        enable_withdraw_fees,
-        lpt_receiver_addr,
-        lpt_min_retain_wei,
-        eth_fee_receiver_addr,
-        eth_fee_withdraw_threshold_wei,
-    })
-}
-
-fn must_env(key: &'static str) -> Result<String, AppError> {
-    env::var(key).map_err(|_| AppError::MissingEnv(key))
-}
-
-fn parse_env_u64_opt(key: &'static str) -> Result<Option<u64>, AppError> {
-    match env::var(key) {
-        Ok(s) => {
-            let v = s
-                .parse::<u64>()
-                .map_err(|e| AppError::BadEnv(key, format!("{e}")))?;
-            Ok(Some(v))
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-fn must_parse_env_u64(key: &'static str) -> Result<u64, AppError> {
-    let s = must_env(key)?;
-    s.parse::<u64>()
-        .map_err(|e| AppError::BadEnv(key, format!("{e}")))
-}
-
-fn parse_env_addr_opt(key: &'static str) -> Result<Option<Address>, AppError> {
-    match env::var(key) {
-        Ok(s) => {
-            let a = s
-                .parse::<Address>()
-                .map_err(|e| AppError::BadEnv(key, format!("{e}")))?;
-            Ok(Some(a))
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-fn must_parse_env_addr(key: &'static str) -> Result<Address, AppError> {
-    let s = must_env(key)?;
-    s.parse::<Address>()
-        .map_err(|e| AppError::BadEnv(key, format!("{e}")))
-}
-
-fn must_parse_env_u256(key: &'static str) -> Result<U256, AppError> {
-    let s = must_env(key)?;
-    // Accept decimal strings
-    U256::from_dec_str(&s).map_err(|e| AppError::BadEnv(key, format!("{e}")))
-}
-
-fn parse_env_bool_opt(key: &'static str) -> Result<Option<bool>, AppError> {
-    match env::var(key) {
-        Ok(raw) => {
-            let v = match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "y" | "on" => true,
-                "0" | "false" | "no" | "n" | "off" => false,
-                _ => {
-                    return Err(AppError::BadEnv(
-                        key,
-                        "expected boolean (true/false)".into(),
-                    ));
-                }
-            };
-            Ok(Some(v))
-        }
-        Err(_) => Ok(None),
-    }
 }

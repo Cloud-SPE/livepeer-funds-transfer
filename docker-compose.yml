@@ -1,6 +1,6 @@
 services:
   funds-transfer:
-    image: tztcloud/livepeer-funds-transfer:0.0.5
+    image: tztcloud/livepeer-funds-transfer:0.0.6
     container_name: "funds-transfer"
     hostname: "funds-transfer"
     restart: unless-stopped
@@ -31,6 +31,13 @@ services:
       # -----------------------------
       LOOP_SLEEP_SECS: "60"
       RECEIPT_TIMEOUT_SECS: "90"
+
+      # -----------------------------
+      # TX FEES
+      # -----------------------------
+      # maxFeePerGas = baseFee * MAX_FEE_BASE_MULTIPLIER + MAX_PRIORITY_FEE_WEI
+      MAX_FEE_BASE_MULTIPLIER: "2"
+      MAX_PRIORITY_FEE_WEI: "0"
 
       ############################################
       # Reward Call SETTINGS

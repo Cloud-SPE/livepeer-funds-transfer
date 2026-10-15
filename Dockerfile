@@ -1,4 +1,4 @@
-FROM rust:1.90.0 as builder
+FROM rust:1.97.1 AS builder
 
 WORKDIR /usr/src/livepeer-funds-transfer
 COPY . .
