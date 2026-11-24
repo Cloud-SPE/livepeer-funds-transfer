@@ -1165,3 +1165,50 @@ async fn authorization_not_checked_without_a_third_party_transfer() {
     }
     h.mock.expect_no_more_requests();
 }
+
+// -------------------------------------------------------------------
+// load_signer
+// -------------------------------------------------------------------
+
+/// A config whose key files live under a fresh, empty temp directory.
+fn key_files_in(dir: &std::path::Path) -> Config {
+    Config {
+        json_key_file: dir.join("key.json").display().to_string(),
+        passphrase_file: dir.join("eth-secret.txt").display().to_string(),
+        ..cfg()
+    }
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("funds-transfer-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn missing_passphrase_file_error_names_the_path() {
+    let dir = temp_dir("no-pass");
+    let cfg = key_files_in(&dir);
+    let msg = load_signer(&cfg).unwrap_err().to_string();
+    let expected = format!(
+        "wallet error: failed to read PASSPHRASE_FILE={}: ",
+        cfg.passphrase_file
+    );
+    assert!(msg.starts_with(&expected), "{msg}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn missing_keystore_error_names_the_path() {
+    let dir = temp_dir("no-key");
+    let cfg = key_files_in(&dir);
+    std::fs::write(&cfg.passphrase_file, "pass\n").unwrap();
+    let msg = load_signer(&cfg).unwrap_err().to_string();
+    let expected = format!(
+        "wallet error: failed to decrypt JSON_KEY_FILE={}: ",
+        cfg.json_key_file
+    );
+    assert!(msg.starts_with(&expected), "{msg}");
+    std::fs::remove_dir_all(dir).unwrap();
+}

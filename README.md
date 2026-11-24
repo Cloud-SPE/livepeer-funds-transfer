@@ -364,7 +364,7 @@ The app writes nothing to disk, so a read-only root filesystem, no Linux capabil
 ```yaml
 services:
   funds-transfer:
-    image: tztcloud/livepeer-funds-transfer:0.0.8
+    image: tztcloud/livepeer-funds-transfer:0.0.9
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -390,7 +390,7 @@ docker compose up -d
 Images up to 0.0.7 ran as root, and stacks mounted the key volume at `/root/keys`. From 0.0.8 the app runs as UID 10001, which cannot enter `/root` or read root-only (`600`) files. An unchanged stack stops at startup, before any RPC call or transaction:
 
 ```
-Error: Wallet("failed to read PASSPHRASE_FILE: Permission denied (os error 13)")
+Error: Wallet("failed to read PASSPHRASE_FILE=/root/keys/eth-secret.txt: Permission denied (os error 13)")
 ```
 
 With `restart: unless-stopped` the container then restart-loops. To upgrade:
@@ -567,12 +567,17 @@ export HTTP_RPC_URL=https://arb1.arbitrum.io/rpc
 # Or add to .env file
 ```
 
-#### 2. "could not load wallet with key and passphrase provided"
-**Cause**: Incorrect passphrase or corrupted keystore
-**Solution**: 
-- Verify passphrase file contains correct passphrase (no trailing newlines)
-- Ensure keystore file is valid JSON
-- Check file permissions
+#### 2. "failed to read PASSPHRASE_FILE=…" or "failed to decrypt JSON_KEY_FILE=…"
+The message names the path the app tried.
+
+**"No such file or directory"**: nothing is at that path inside the container.
+- Check `JSON_KEY_FILE` / `PASSPHRASE_FILE` point under the mount point, e.g. `/keys/key.json`
+- Check the volume line uses a colon: `- <volume>:/keys:ro`. With a comma (`/keys,ro`) Docker mounts the volume at a directory literally named `/keys,ro`, and `/keys` stays empty
+- An unset `${PASSPHRASE_FILE}` in a compose file becomes an empty string; the app rejects that at startup with "must not be empty"
+
+**"Permission denied"**: see [#6](#6-failed-to-read-passphrase_file-permission-denied-os-error-13).
+
+**Decrypt errors** (for example a MAC mismatch): the passphrase does not match the keystore, or the keystore is corrupted. A trailing newline in the passphrase file is ignored.
 
 #### 3. "Transfer Bond Transaction failed"
 **Causes**:
@@ -600,7 +605,7 @@ trust store, and none is installed (for example a custom image built `FROM debia
 `restart: unless-stopped` restart-loops.
 **Solution**: Install `ca-certificates` in the runtime image, as the provided Dockerfile does.
 
-#### 6. "failed to read PASSPHRASE_FILE: Permission denied (os error 13)"
+#### 6. "failed to read PASSPHRASE_FILE=…: Permission denied (os error 13)"
 **Cause**: The container runs as UID 10001 and cannot read the key files: they are root-only, or mounted under `/root` (for example a stack written for a root image).
 **Solution**: Grant UID/GID 10001 read access and mount the files at `/keys`; see [Upgrading from 0.0.7 or Earlier](#upgrading-from-007-or-earlier).
 

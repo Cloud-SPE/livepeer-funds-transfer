@@ -127,8 +127,8 @@ pub fn load_config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<Confi
     let rounds_manager_addr = must_parse_env_addr(env, "ROUNDS_MANAGER_ADDR")?;
     let bonding_manager_addr = must_parse_env_addr(env, "BONDING_MANAGER_ADDR")?;
 
-    let json_key_file = must_env(env, "JSON_KEY_FILE")?;
-    let passphrase_file = must_env(env, "PASSPHRASE_FILE")?;
+    let json_key_file = must_env_path(env, "JSON_KEY_FILE")?;
+    let passphrase_file = must_env_path(env, "PASSPHRASE_FILE")?;
     let orchestrator_addr = parse_env_addr_opt(env, "ORCHESTRATOR_ADDR")?;
 
     let loop_sleep_secs = parse_env_u64_opt(env, "LOOP_SLEEP_SECS")?.unwrap_or(6);
@@ -188,6 +188,16 @@ pub fn load_config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<Confi
 
 fn must_env(env: Lookup, key: &'static str) -> Result<String, AppError> {
     env(key).ok_or(AppError::MissingEnv(key))
+}
+
+/// A required file path. Compose substitutes an unset `${VAR}` with an empty string, which would
+/// otherwise surface later as a confusing "No such file or directory".
+fn must_env_path(env: Lookup, key: &'static str) -> Result<String, AppError> {
+    let s = must_env(env, key)?;
+    if s.trim().is_empty() {
+        return Err(AppError::BadEnv(key, "must not be empty".into()));
+    }
+    Ok(s)
 }
 
 fn parse_env_u64_opt(env: Lookup, key: &'static str) -> Result<Option<u64>, AppError> {
@@ -607,6 +617,16 @@ mod tests {
         ] {
             let msg = bad_env(load(&with(required(), key, "")), key);
             assert_eq!(msg, "must not be empty");
+        }
+    }
+
+    #[test]
+    fn empty_key_file_paths_are_rejected() {
+        for key in ["JSON_KEY_FILE", "PASSPHRASE_FILE"] {
+            for raw in ["", "  "] {
+                let msg = bad_env(load(&with(required(), key, raw)), key);
+                assert_eq!(msg, "must not be empty", "{key}={raw:?}");
+            }
         }
     }
 

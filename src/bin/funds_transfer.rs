@@ -66,15 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| AppError::Provider(format!("invalid HTTP_RPC_URL: {e}")))?;
 
-    // load wallet (keystore + passphrase files)
-    let passphrase = std::fs::read_to_string(&cfg.passphrase_file)
-        .map_err(|e| AppError::Wallet(format!("failed to read PASSPHRASE_FILE: {e}")))?;
-    let passphrase = passphrase.trim_end();
-
-    let key_json_path = Path::new(&cfg.json_key_file);
-    let signer = PrivateKeySigner::decrypt_keystore(key_json_path, passphrase)
-        .map_err(|e| AppError::Wallet(format!("failed to decrypt JSON_KEY_FILE: {e}")))?;
-
+    let signer = load_signer(&cfg)?;
     let signer_addr = signer.address();
     let orchestrator_addr = cfg.orchestrator_addr.unwrap_or(signer_addr);
 
@@ -111,6 +103,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
         sleep(Duration::from_secs(cfg.loop_sleep_secs)).await;
     }
+}
+
+/// Decrypts the keystore at JSON_KEY_FILE with the passphrase in PASSPHRASE_FILE.
+///
+/// Errors name the path, so a wrong path or a volume mounted somewhere else is obvious from the
+/// log. The paths are configuration, not secrets.
+fn load_signer(cfg: &Config) -> Result<PrivateKeySigner, AppError> {
+    let passphrase = std::fs::read_to_string(&cfg.passphrase_file).map_err(|e| {
+        AppError::Wallet(format!(
+            "failed to read PASSPHRASE_FILE={}: {e}",
+            cfg.passphrase_file
+        ))
+    })?;
+    PrivateKeySigner::decrypt_keystore(Path::new(&cfg.json_key_file), passphrase.trim_end())
+        .map_err(|e| {
+            AppError::Wallet(format!(
+                "failed to decrypt JSON_KEY_FILE={}: {e}",
+                cfg.json_key_file
+            ))
+        })
 }
 
 /// Outcome of a passed startup third-party bonder authorization check.
