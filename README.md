@@ -42,8 +42,11 @@ livepeer-funds-transfer/
 │   ├── bin/
 │   │   └── funds_transfer.rs    # Main application logic
 │   ├── lib.rs
-│   ├── contracts.rs             # abigen bindings
+│   ├── client.rs                # signing provider + receipt polling
+│   ├── config.rs                # environment configuration
+│   ├── contracts.rs             # alloy sol! bindings
 │   ├── reward_hints.rs          # rewardWithHint position hints + reward math
+│   ├── mock_rpc.rs              # scripted JSON-RPC transport (tests only)
 │   └── abi/                     # From livepeer/protocol deployments/arbitrumMainnet
 │       ├── BondingManager.json
 │       ├── Controller.json
@@ -56,12 +59,9 @@ livepeer-funds-transfer/
 
 ### Key Dependencies
 
-- **tokio**: Async runtime for concurrent operations
-- **ethers**: Ethereum/Arbitrum blockchain interaction library
-- **dotenv**: Environment variable management
-- **serde/serde_json**: Serialization/deserialization
-- **tracing**: Structured logging and diagnostics
-- **chrono**: Date and time utilities
+- **alloy**: Ethereum/Arbitrum contract bindings (`sol!`), JSON-RPC provider, local keystore signing
+- **tokio**: Async runtime
+- **tracing** / **tracing-subscriber**: Structured logging and diagnostics
 
 ### Smart Contract Integration
 
@@ -119,7 +119,9 @@ source $HOME/.cargo/env
 
 ### Environment Variables
 
-Create a `.env` file in the project root with the following variables:
+Configuration is read from environment variables only; the binary does not load a `.env`
+file itself. Keeping them in a `.env` file works with Docker (`--env-file .env`, or `env_file:`
+in Compose) or by exporting it into your shell (see [Local Execution](#local-execution)):
 
 ```bash
 # Logging configuration
@@ -259,10 +261,9 @@ test checks that hints always satisfy `SortedDoublyLL.validInsertPosition` on ra
 
 ### Local Execution
 
-1. **Set up environment**:
+1. **Set up environment** (export the variables from your `.env` file):
    ```bash
-   cp .env.example .env
-   # Edit .env with your configuration
+   set -a; source .env; set +a
    ```
 
 2. **Run the application**:
@@ -355,7 +356,8 @@ docker-compose up -d
 
 The Dockerfile uses a multi-stage build:
 1. **Builder stage**: Compiles the Rust application with all dependencies
-2. **Runtime stage**: Creates minimal Debian-based image with only the binary
+2. **Runtime stage**: Creates minimal Debian-based image with only the binary and
+   `ca-certificates` (TLS to the RPC is verified against the OS trust store)
 
 This reduces the final image size significantly (from ~2GB to ~100MB).
 
@@ -520,14 +522,21 @@ export HTTP_RPC_URL=https://arb1.arbitrum.io/rpc
 - Upgrade to a version that prices fees from the base fee (`MAX_FEE_BASE_MULTIPLIER`)
 - Keep a small ETH buffer on the orchestrator wallet for gas
 
-#### 5. Connection timeouts
+#### 5. Panic at startup: "No CA certificates were loaded from the system"
+**Cause**: The HTTP client verifies the RPC's TLS certificate against the operating system's
+trust store, and none is installed (for example a custom image built `FROM debian` without
+`ca-certificates`). The binary panics before the first RPC call, so a container with
+`restart: unless-stopped` restart-loops.
+**Solution**: Install `ca-certificates` in the runtime image, as the provided Dockerfile does.
+
+#### 6. Connection timeouts
 **Cause**: RPC endpoint unreachable or rate limited
 **Solution**:
 - Try alternative RPC endpoint
 - Use authenticated/paid RPC service
 - Increase timeout values (requires code modification)
 
-#### 5. "Current Round is not locked"
+#### 7. "Current Round is not locked"
 **Cause**: Normal operation - rounds are not always locked
 **Solution**: Wait for next round lock (rounds lock periodically in Livepeer protocol)
 

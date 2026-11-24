@@ -5,7 +5,7 @@
 
 use std::{env, fmt};
 
-use ethers::types::{Address, U256};
+use alloy::primitives::{Address, U256};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -140,7 +140,7 @@ pub fn load_config_from(lookup: impl Fn(&str) -> Option<String>) -> Result<Confi
     }
     let max_priority_fee_wei = match env("MAX_PRIORITY_FEE_WEI") {
         Some(_) => must_parse_env_u256(env, "MAX_PRIORITY_FEE_WEI")?,
-        None => U256::zero(),
+        None => U256::ZERO,
     };
 
     let (lpt_receiver_addr, lpt_min_retain_wei) = if enable_transfer_bond {
@@ -225,12 +225,16 @@ fn must_parse_env_addr(env: Lookup, key: &'static str) -> Result<Address, AppErr
 
 fn must_parse_env_u256(env: Lookup, key: &'static str) -> Result<U256, AppError> {
     let s = must_env(env, key)?;
-    // from_dec_str("") is Ok(0); an empty LPT_MIN_RETAIN_WEI would transfer the whole stake.
+    // An empty or digit-free value must never read as 0: an empty LPT_MIN_RETAIN_WEI would
+    // transfer the whole stake.
     if s.is_empty() {
         return Err(AppError::BadEnv(key, "must not be empty".into()));
     }
-    // Accept decimal strings
-    U256::from_dec_str(&s).map_err(|e| AppError::BadEnv(key, format!("{e}")))
+    // U256::from_str_radix ignores `_` (so "_" would parse as 0), so check the digits first.
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(AppError::BadEnv(key, "expected a decimal integer".into()));
+    }
+    U256::from_str_radix(&s, 10).map_err(|e| AppError::BadEnv(key, format!("{e}")))
 }
 
 fn parse_env_bool_opt(env: Lookup, key: &'static str) -> Result<Option<bool>, AppError> {
@@ -342,7 +346,7 @@ mod tests {
         assert_eq!(cfg.loop_sleep_secs, 6);
         assert_eq!(cfg.receipt_timeout_secs, 90);
         assert_eq!(cfg.max_fee_base_multiplier, 2);
-        assert_eq!(cfg.max_priority_fee_wei, U256::zero());
+        assert_eq!(cfg.max_priority_fee_wei, U256::ZERO);
         assert!(cfg.enable_reward);
         assert!(cfg.enable_transfer_bond);
         assert!(cfg.enable_withdraw_fees);
@@ -559,16 +563,40 @@ mod tests {
             "LPT_MIN_RETAIN_WEI",
             "ETH_FEE_WITHDRAW_THRESHOLD_WEI",
         ] {
-            for raw in [" ", "abc", "-1", "1.5", "1e18", "0x10", too_big.as_str()] {
+            for raw in [
+                " ",
+                "abc",
+                "-1",
+                "+1",
+                "1.5",
+                "1e18",
+                "0x10",
+                " 10",
+                "_",
+                "1_000",
+                too_big.as_str(),
+            ] {
                 bad_env(load(&with(required(), key, raw)), key);
             }
         }
     }
 
     #[test]
+    fn underscores_are_not_digit_separators() {
+        // U256::from_str_radix skips `_`, which would turn "_" into 0 (transfer everything).
+        for raw in ["_", "__", "1_000"] {
+            let msg = bad_env(
+                load(&with(required(), "LPT_MIN_RETAIN_WEI", raw)),
+                "LPT_MIN_RETAIN_WEI",
+            );
+            assert_eq!(msg, "expected a decimal integer");
+        }
+    }
+
+    #[test]
     fn empty_u256_values_are_rejected() {
-        // U256::from_dec_str("") is Ok(0); an empty LPT_MIN_RETAIN_WEI must not mean
-        // "retain nothing" and transfer the whole stake.
+        // An empty LPT_MIN_RETAIN_WEI must not mean "retain nothing" and transfer the whole
+        // stake.
         for key in [
             "MAX_PRIORITY_FEE_WEI",
             "LPT_MIN_RETAIN_WEI",
@@ -584,8 +612,8 @@ mod tests {
         let vars = with(required(), "LPT_MIN_RETAIN_WEI", "0");
         let vars = with(vars, "ETH_FEE_WITHDRAW_THRESHOLD_WEI", "0");
         let cfg = load(&vars).unwrap();
-        assert_eq!(cfg.lpt_min_retain_wei, Some(U256::zero()));
-        assert_eq!(cfg.eth_fee_withdraw_threshold_wei, Some(U256::zero()));
+        assert_eq!(cfg.lpt_min_retain_wei, Some(U256::ZERO));
+        assert_eq!(cfg.eth_fee_withdraw_threshold_wei, Some(U256::ZERO));
     }
 
     #[test]
@@ -595,7 +623,7 @@ mod tests {
         let vars = with(vars, "MAX_PRIORITY_FEE_WEI", "0");
         let cfg = load(&vars).unwrap();
         assert_eq!(cfg.lpt_min_retain_wei, Some(U256::MAX));
-        assert_eq!(cfg.max_priority_fee_wei, U256::zero());
+        assert_eq!(cfg.max_priority_fee_wei, U256::ZERO);
     }
 
     #[test]
@@ -720,7 +748,7 @@ mod tests {
 
         #[test]
         fn any_u256_round_trips(limbs in any::<[u64; 4]>()) {
-            let v = U256(limbs);
+            let v = U256::from_limbs(limbs);
             let cfg = load(&with(required(), "ETH_FEE_WITHDRAW_THRESHOLD_WEI", &v.to_string())).unwrap();
             prop_assert_eq!(cfg.eth_fee_withdraw_threshold_wei, Some(v));
         }
