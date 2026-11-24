@@ -1090,3 +1090,57 @@ async fn poll_logs_action_errors_and_still_records_state() {
         .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
     h.mock.expect_no_more_requests();
 }
+
+// -------------------------------------------------------------------
+// check_transfer_bond_authorization
+// -------------------------------------------------------------------
+
+#[tokio::test]
+async fn authorization_check_asks_if_receiver_authorized_signer() {
+    for (authorized, expected) in [
+        (true, BondAuthorization::Authorized),
+        (false, BondAuthorization::NotAuthorized),
+    ] {
+        let h = harness();
+        h.mock.ret(authorized);
+        let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg()).await;
+        assert_eq!(got, expected);
+        // The receiver is the delegator; the signer (the transferBond sender) is the bonder.
+        h.mock.expect_call(
+            &h.bonding
+                .isThirdPartyBonderAuthorized(addr(LPT_RECEIVER), h.signer),
+        );
+        h.mock.expect_no_more_requests();
+    }
+}
+
+#[tokio::test]
+async fn authorization_check_failure_does_not_stop_startup() {
+    let h = harness();
+    h.mock.err("eth_call");
+    let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg()).await;
+    assert_eq!(got, BondAuthorization::Unknown);
+    h.mock.expect_call(
+        &h.bonding
+            .isThirdPartyBonderAuthorized(addr(LPT_RECEIVER), h.signer),
+    );
+    h.mock.expect_no_more_requests();
+}
+
+#[tokio::test]
+async fn authorization_not_checked_without_a_third_party_transfer() {
+    let h = harness();
+    let disabled = Config {
+        enable_transfer_bond: false,
+        ..cfg()
+    };
+    let to_self = Config {
+        lpt_receiver_addr: Some(h.signer),
+        ..cfg()
+    };
+    for cfg in [disabled, to_self] {
+        let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg).await;
+        assert_eq!(got, BondAuthorization::NotNeeded);
+    }
+    h.mock.expect_no_more_requests();
+}

@@ -1,9 +1,14 @@
 services:
   funds-transfer:
-    image: tztcloud/livepeer-funds-transfer:0.0.7
+    image: tztcloud/livepeer-funds-transfer:0.0.8
     container_name: "funds-transfer"
     hostname: "funds-transfer"
     restart: unless-stopped
+    # Hardening: the image runs as UID/GID 10001; nothing in the container is writable or
+    # privileged, since the app only reads its key files and talks to the RPC.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     environment:
       # -----------------------------
       # RPC / CHAIN
@@ -20,8 +25,9 @@ services:
       # -----------------------------
       # KEYSTORE / SECRETS (PATHS ONLY)
       # -----------------------------
-      JSON_KEY_FILE: "/root/keys/orchestrator_keystore.json"
-      PASSPHRASE_FILE: "/root/keys/orchestrator_passphrase.txt"
+      # The volume is mounted at /keys; UID 10001 must be able to read both files.
+      JSON_KEY_FILE: "/keys/orchestrator_keystore.json"
+      PASSPHRASE_FILE: "/keys/orchestrator_passphrase.txt"
 
       # Optional — if omitted, derived from keystore
       ORCHESTRATOR_ADDR: "0xYourOrchestratorAddress"
@@ -66,7 +72,7 @@ services:
       # -----------------------------
       RUST_LOG: "info"
     volumes:
-      - lpData:/root/keys
+      - lpData:/keys:ro
 volumes:
   lpData:
     external: true

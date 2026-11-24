@@ -91,6 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rounds = RoundsManager::new(cfg.rounds_manager_addr, provider.clone());
     let bonding = BondingManager::new(cfg.bonding_manager_addr, provider);
 
+    // Before the loop, so a missing authorization shows up at startup rather than as failing
+    // transfers at the next locked round.
+    check_transfer_bond_authorization(&bonding, signer_addr, &cfg).await;
+
     let mut last_state: Option<RoundState> = None;
     let mut last_locked_snapshot: Option<LockedSnapshot> = None;
 
@@ -105,6 +109,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await;
         sleep(Duration::from_secs(cfg.loop_sleep_secs)).await;
+    }
+}
+
+/// Outcome of the startup third-party bonder authorization check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BondAuthorization {
+    /// transferBond is disabled, or the receiver is the signer itself (not a third party).
+    NotNeeded,
+    Authorized,
+    NotAuthorized,
+    /// The check itself failed: an RPC error, or a BondingManager without the registry.
+    Unknown,
+}
+
+/// Checks whether LPT_RECEIVER_ADDR has authorized the signer as a third-party bonder.
+///
+/// The signer sends transferBond, which bonds stake to the receiver: that makes the signer a
+/// third-party bonder for the receiver. Once the protocol enforces third-party bonding
+/// authorization, the transfer only succeeds if the receiver has called
+/// `setThirdPartyBonderAuthorization(signer, true)`. The outcome is logged for the operator.
+/// It never stops the app, because rewards and fee withdrawals do not depend on it.
+async fn check_transfer_bond_authorization<P: Provider>(
+    bonding: &BondingManagerInstance<P>,
+    signer: Address,
+    cfg: &Config,
+) -> BondAuthorization {
+    let receiver = match cfg.lpt_receiver_addr {
+        Some(receiver) if cfg.enable_transfer_bond && receiver != signer => receiver,
+        _ => return BondAuthorization::NotNeeded,
+    };
+    match bonding
+        .isThirdPartyBonderAuthorized(receiver, signer)
+        .call()
+        .await
+    {
+        Ok(true) => {
+            info!(
+                "transferBond authorization OK: LPT_RECEIVER_ADDR={receiver:?} has authorized signer={signer:?} as a third-party bonder"
+            );
+            BondAuthorization::Authorized
+        }
+        Ok(false) => {
+            warn!(
+                "transferBond authorization MISSING: LPT_RECEIVER_ADDR={receiver:?} has not authorized signer={signer:?} as a third-party bonder. \
+                 Once the protocol enforces third-party bonding authorization, every transferBond will fail. \
+                 Fix: from {receiver:?}, call setThirdPartyBonderAuthorization({signer:?}, true) on BondingManager {:?}. \
+                 Rewards and fee withdrawals are not affected.",
+                bonding.address()
+            );
+            BondAuthorization::NotAuthorized
+        }
+        Err(e) => {
+            warn!("transferBond authorization check failed: {e}; continuing without it");
+            BondAuthorization::Unknown
+        }
     }
 }
 

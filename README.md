@@ -163,7 +163,7 @@ LOOP_SLEEP_SECS=60
 
 ### Configuration Details
 
-#### RPC_ENDPOINT_URL
+#### HTTP_RPC_URL
 - Public Arbitrum RPC: `https://arb1.arbitrum.io/rpc`
 - Consider using a dedicated RPC provider (Infura, Alchemy, QuickNode) for production
 - Rate limits may apply to public endpoints
@@ -186,9 +186,26 @@ LOOP_SLEEP_SECS=60
 
 #### Address Configuration
 
-- **ORCH_ETH_ADDR**: The orchestrator wallet that holds bonded LPT and accumulates fees
-- **TRANSFER_BOND_RECIPIENT_ETH_ADDR**: Destination for transferred LPT bonds (typically your main staking wallet)
-- **ETH_FEE_RECIPIENT_ETH_ADDR**: Destination for withdrawn ETH fees (can be the same as bond recipient)
+- **ORCHESTRATOR_ADDR** (optional): The orchestrator wallet that holds bonded LPT and accumulates fees. Defaults to the keystore's address.
+- **LPT_RECEIVER_ADDR**: Destination for transferred LPT bonds (typically your main staking wallet)
+- **ETH_FEE_RECEIVER_ADDR**: Destination for withdrawn ETH fees (can be the same as bond recipient)
+
+#### Third-Party Bonder Authorization
+
+`transferBond` bonds the signer's stake to `LPT_RECEIVER_ADDR`, which makes the signer a third-party bonder for that receiver. Once Livepeer enforces third-party bonding authorization ([forum post](https://forum.livepeer.org/t/upcoming-breaking-protocol-change-third-party-bonding-will-require-authorization/3401)), the transfer only succeeds if the receiver has authorized the signer. The receiver does this once, from its own wallet, on the BondingManager proxy `0x35Bcf3c30594191d53231E4FF333E8A770453e40`:
+
+```
+setThirdPartyBonderAuthorization(<signer address>, true)
+```
+
+When `ENABLE_TRANSFER_BOND=true`, the app checks `isThirdPartyBonderAuthorized(LPT_RECEIVER_ADDR, signer)` once at startup and logs the result:
+
+```
+INFO funds_transfer: transferBond authorization OK: LPT_RECEIVER_ADDR=0x… has authorized signer=0x… as a third-party bonder
+WARN funds_transfer: transferBond authorization MISSING: LPT_RECEIVER_ADDR=0x… has not authorized signer=0x… as a third-party bonder. … Fix: from 0x…, call setThirdPartyBonderAuthorization(0x…, true) on BondingManager 0x…. …
+```
+
+A missing authorization, or a check that fails (for example an RPC error), is logged as a warning and the app keeps running: rewards and fee withdrawals do not depend on it, and transfers keep working until enforcement starts.
 
 #### Operational Parameters
 
@@ -306,60 +323,108 @@ If a transaction fails, the error is logged and the operation is retried on the 
 
 ## Docker Deployment
 
+The image runs as an unprivileged user, UID/GID **10001**, and expects the keystore and passphrase files under **`/keys`**. Both files must be readable by UID or GID 10001. For volumes created for older images, see [Upgrading from 0.0.7 or Earlier](#upgrading-from-007-or-earlier).
+
 ### Building the Docker Image
 
 ```bash
 docker build -t livepeer-funds-transfer:latest .
 ```
 
+`.dockerignore` is an allow-list: only `Cargo.toml`, `Cargo.lock` and `src/` are sent to the build, so keys, `.env` files and deployment stacks never reach it.
+
 ### Running with Docker
 
+With `JSON_KEY_FILE=/keys/keystore.json` and `PASSPHRASE_FILE=/keys/passphrase.txt` in `.env`:
+
 ```bash
+# One time: let the container user read the key files
+sudo chown -R 10001:10001 /path/to/keys
+sudo chmod 700 /path/to/keys && sudo chmod 600 /path/to/keys/*
+
 docker run -d \
   --name livepeer-funds-transfer \
   --env-file .env \
-  -v /path/to/keystore:/root/keystore \
-  -v /path/to/passphrase.txt:/root/passphrase.txt \
+  --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+  -v /path/to/keys:/keys:ro \
   livepeer-funds-transfer:latest
 ```
 
+The app writes nothing to disk, so a read-only root filesystem, no Linux capabilities and a read-only key mount all work.
+
 ### Docker Compose
 
-Create a `docker-compose.yml`:
+`docker-compose.yml` in this repo is a complete example. The parts that matter:
 
 ```yaml
-version: '3.8'
-
 services:
   funds-transfer:
-    build: .
-    container_name: livepeer-funds-transfer
+    image: tztcloud/livepeer-funds-transfer:0.0.8
     restart: unless-stopped
-    env_file:
-      - .env
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      JSON_KEY_FILE: "/keys/orchestrator_keystore.json"
+      PASSPHRASE_FILE: "/keys/orchestrator_passphrase.txt"
+      # ...the rest of the configuration
     volumes:
-      - ./keystore:/root/keystore:ro
-      - ./passphrase.txt:/root/passphrase.txt:ro
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - lpData:/keys:ro
+volumes:
+  lpData:
+    external: true
 ```
 
 Run with:
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
-### Multi-Stage Build Benefits
+### Upgrading from 0.0.7 or Earlier
+
+Images up to 0.0.7 ran as root, and stacks mounted the key volume at `/root/keys`. From 0.0.8 the app runs as UID 10001, which cannot enter `/root` or read root-only (`600`) files. An unchanged stack stops at startup, before any RPC call or transaction:
+
+```
+Error: Wallet("failed to read PASSPHRASE_FILE: Permission denied (os error 13)")
+```
+
+With `restart: unless-stopped` the container then restart-loops. To upgrade:
+
+1. **Let UID/GID 10001 read the two files in the existing volume.** This is a one-time change. Root stays the owner, so anything else that uses the volume is unaffected, and it is safe to run while the old root container is still running.
+   ```bash
+   docker run --rm -v <volume>:/v debian:trixie-slim sh -c \
+     'chgrp 10001 /v /v/key.json /v/eth-secret.txt && chmod g+x /v && chmod g+r /v/key.json /v/eth-secret.txt'
+   ```
+   Use your own file names. If only this app uses the volume, `chown -R 10001:10001 /v` works too.
+2. **Mount the volume at `/keys`, read-only, and point the paths there:**
+   ```yaml
+   volumes:
+     - <volume>:/keys:ro
+   environment:
+     - JSON_KEY_FILE=/keys/key.json
+     - PASSPHRASE_FILE=/keys/eth-secret.txt
+   ```
+3. **Optionally harden the service** with `read_only: true`, `cap_drop: [ALL]` and `security_opt: ["no-new-privileges:true"]`.
+
+Stacks written for 0.0.1–0.0.2 also use older variable names. Rename them; the app does not read the old ones and stops at startup naming the first missing variable:
+
+| Old name | Current name |
+|---|---|
+| `RPC_ENDPOINT_URL` | `HTTP_RPC_URL` |
+| `ORCH_ETH_ADDR` | `ORCHESTRATOR_ADDR` (optional) |
+| `TRANSFER_BOND_RECIPIENT_ETH_ADDR` | `LPT_RECEIVER_ADDR` |
+| `ETH_FEE_RECIPIENT_ETH_ADDR` | `ETH_FEE_RECEIVER_ADDR` |
+| `LPT_RESERVE_AMOUNT` (LPT, e.g. `1125.0`) | `LPT_MIN_RETAIN_WEI` (wei, e.g. `1125000000000000000000`) |
+
+The current version also requires `ROUNDS_MANAGER_ADDR`, `BONDING_MANAGER_ADDR` and `ETH_FEE_WITHDRAW_THRESHOLD_WEI`; see [Environment Variables](#environment-variables).
+
+### Image Build
 
 The Dockerfile uses a multi-stage build:
-1. **Builder stage**: Compiles the Rust application with all dependencies
-2. **Runtime stage**: Creates minimal Debian-based image with only the binary and
-   `ca-certificates` (TLS to the RPC is verified against the OS trust store)
+1. **Builder stage** (`rust:1.97.1-trixie`): `cargo install --locked` builds exactly the dependency versions in `Cargo.lock`
+2. **Runtime stage** (`debian:trixie-slim`): only the binary, `ca-certificates` (TLS to the RPC is verified against the OS trust store) and the unprivileged `app` user
 
-This reduces the final image size significantly (from ~2GB to ~100MB).
+Both stages are pinned to Debian 13 (trixie), so the runtime's glibc matches the one the binary was built against. The runtime image is about 95 MB.
 
 ## Operations
 
@@ -464,6 +529,7 @@ stays at ~490–550k regardless of position.
 ### Operational Security
 
 1. **Minimum Privilege**:
+   - The Docker image runs as UID 10001, not root, and works with a read-only filesystem, no capabilities and a read-only key mount (see [Docker Deployment](#docker-deployment))
    - Run the application with minimal necessary permissions
    - Use dedicated service accounts
    - Implement principle of least privilege
@@ -529,14 +595,22 @@ trust store, and none is installed (for example a custom image built `FROM debia
 `restart: unless-stopped` restart-loops.
 **Solution**: Install `ca-certificates` in the runtime image, as the provided Dockerfile does.
 
-#### 6. Connection timeouts
+#### 6. "failed to read PASSPHRASE_FILE: Permission denied (os error 13)"
+**Cause**: The container runs as UID 10001 and cannot read the key files: they are root-only, or mounted under `/root` (for example a stack written for a root image).
+**Solution**: Grant UID/GID 10001 read access and mount the files at `/keys`; see [Upgrading from 0.0.7 or Earlier](#upgrading-from-007-or-earlier).
+
+#### 7. "transferBond authorization MISSING" at startup
+**Cause**: `LPT_RECEIVER_ADDR` has not authorized the signer as a third-party bonder. Transfers keep working until Livepeer enforces the authorization, then every `transferBond` fails.
+**Solution**: From the receiver's wallet, call `setThirdPartyBonderAuthorization(<signer>, true)` on the BondingManager; see [Third-Party Bonder Authorization](#third-party-bonder-authorization). Restart the app to see the check pass.
+
+#### 8. Connection timeouts
 **Cause**: RPC endpoint unreachable or rate limited
 **Solution**:
 - Try alternative RPC endpoint
 - Use authenticated/paid RPC service
 - Increase timeout values (requires code modification)
 
-#### 7. "Current Round is not locked"
+#### 9. "Current Round is not locked"
 **Cause**: Normal operation - rounds are not always locked
 **Solution**: Wait for next round lock (rounds lock periodically in Livepeer protocol)
 
