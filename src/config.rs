@@ -50,6 +50,8 @@ pub enum AppError {
     Wallet(String),
     Contract(String),
     Tx(String),
+    /// A required on-chain authorization is missing (see the startup bonder check).
+    Unauthorized(String),
 }
 
 impl fmt::Display for AppError {
@@ -61,6 +63,7 @@ impl fmt::Display for AppError {
             AppError::Wallet(e) => write!(f, "wallet error: {e}"),
             AppError::Contract(e) => write!(f, "contract error: {e}"),
             AppError::Tx(e) => write!(f, "tx error: {e}"),
+            AppError::Unauthorized(e) => write!(f, "authorization missing: {e}"),
         }
     }
 }

@@ -1095,36 +1095,57 @@ async fn poll_logs_action_errors_and_still_records_state() {
 // check_transfer_bond_authorization
 // -------------------------------------------------------------------
 
-#[tokio::test]
-async fn authorization_check_asks_if_receiver_authorized_signer() {
-    for (authorized, expected) in [
-        (true, BondAuthorization::Authorized),
-        (false, BondAuthorization::NotAuthorized),
-    ] {
-        let h = harness();
-        h.mock.ret(authorized);
-        let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg()).await;
-        assert_eq!(got, expected);
-        // The receiver is the delegator; the signer (the transferBond sender) is the bonder.
-        h.mock.expect_call(
-            &h.bonding
-                .isThirdPartyBonderAuthorized(addr(LPT_RECEIVER), h.signer),
-        );
-        h.mock.expect_no_more_requests();
-    }
-}
-
-#[tokio::test]
-async fn authorization_check_failure_does_not_stop_startup() {
-    let h = harness();
-    h.mock.err("eth_call");
-    let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg()).await;
-    assert_eq!(got, BondAuthorization::Unknown);
+/// The receiver is the delegator; the signer (the transferBond sender) is the bonder.
+fn expect_authorization_call(h: &Harness) {
     h.mock.expect_call(
         &h.bonding
             .isThirdPartyBonderAuthorized(addr(LPT_RECEIVER), h.signer),
     );
     h.mock.expect_no_more_requests();
+}
+
+#[tokio::test]
+async fn authorization_check_passes_when_receiver_authorized_signer() {
+    let h = harness();
+    h.mock.ret(true);
+    let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg()).await;
+    assert_eq!(got.unwrap(), BondAuthorization::Authorized);
+    expect_authorization_call(&h);
+}
+
+#[tokio::test]
+async fn missing_authorization_refuses_to_start_and_says_how_to_fix_it() {
+    let h = harness();
+    h.mock.ret(false);
+    let err = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg())
+        .await
+        .unwrap_err();
+    let AppError::Unauthorized(msg) = &err else {
+        panic!("expected Unauthorized, got {err:?}");
+    };
+    let fix = format!("setThirdPartyBonderAuthorization({:?}, true)", h.signer);
+    let receiver = format!("LPT_RECEIVER_ADDR={:?}", addr(LPT_RECEIVER));
+    let bonding = format!("BondingManager {:?}", addr(BONDING));
+    for part in [&fix, &receiver, &bonding, "ENABLE_TRANSFER_BOND=false"] {
+        assert!(msg.contains(part), "{part:?} not in {msg}");
+    }
+    expect_authorization_call(&h);
+}
+
+#[tokio::test]
+async fn failed_authorization_check_refuses_to_start() {
+    let h = harness();
+    h.mock.err("eth_call");
+    let err = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg())
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("contract error: isThirdPartyBonderAuthorized() failed:"),
+        "{msg}"
+    );
+    assert!(msg.contains("ENABLE_TRANSFER_BOND=false"), "{msg}");
+    expect_authorization_call(&h);
 }
 
 #[tokio::test]
@@ -1140,7 +1161,7 @@ async fn authorization_not_checked_without_a_third_party_transfer() {
     };
     for cfg in [disabled, to_self] {
         let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg).await;
-        assert_eq!(got, BondAuthorization::NotNeeded);
+        assert_eq!(got.unwrap(), BondAuthorization::NotNeeded);
     }
     h.mock.expect_no_more_requests();
 }

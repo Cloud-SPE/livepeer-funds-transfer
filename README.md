@@ -198,14 +198,19 @@ LOOP_SLEEP_SECS=60
 setThirdPartyBonderAuthorization(<signer address>, true)
 ```
 
-When `ENABLE_TRANSFER_BOND=true`, the app checks `isThirdPartyBonderAuthorized(LPT_RECEIVER_ADDR, signer)` once at startup and logs the result:
+When `ENABLE_TRANSFER_BOND=true`, the app checks `isThirdPartyBonderAuthorized(LPT_RECEIVER_ADDR, signer)` at startup, before the main loop. If the authorization is in place it logs:
 
 ```
 INFO funds_transfer: transferBond authorization OK: LPT_RECEIVER_ADDR=0x… has authorized signer=0x… as a third-party bonder
-WARN funds_transfer: transferBond authorization MISSING: LPT_RECEIVER_ADDR=0x… has not authorized signer=0x… as a third-party bonder. … Fix: from 0x…, call setThirdPartyBonderAuthorization(0x…, true) on BondingManager 0x…. …
 ```
 
-A missing authorization, or a check that fails (for example an RPC error), is logged as a warning and the app keeps running: rewards and fee withdrawals do not depend on it, and transfers keep working until enforcement starts.
+If it is missing, the app **refuses to start** (exit code 1, before any transaction) and says how to fix it:
+
+```
+ERROR funds_transfer: refusing to start: authorization missing: LPT_RECEIVER_ADDR=0x… has not authorized signer=0x… as a third-party bonder, so transferBond fails once the protocol enforces third-party bonding authorization. Fix: from 0x…, call setThirdPartyBonderAuthorization(0x…, true) on BondingManager 0x…, then restart. To run without transfers, set ENABLE_TRANSFER_BOND=false.
+```
+
+It also refuses to start when the check itself fails (for example an RPC error), since the authorization cannot be confirmed. Under `restart: unless-stopped` Docker retries, so a brief RPC outage clears on its own. While the app is not running, it calls no rewards either, so fix the authorization promptly, or set `ENABLE_TRANSFER_BOND=false` to keep rewards and fee withdrawals running without transfers. The check is skipped when transfers are disabled or `LPT_RECEIVER_ADDR` is the signer itself.
 
 #### Operational Parameters
 
@@ -599,9 +604,10 @@ trust store, and none is installed (for example a custom image built `FROM debia
 **Cause**: The container runs as UID 10001 and cannot read the key files: they are root-only, or mounted under `/root` (for example a stack written for a root image).
 **Solution**: Grant UID/GID 10001 read access and mount the files at `/keys`; see [Upgrading from 0.0.7 or Earlier](#upgrading-from-007-or-earlier).
 
-#### 7. "transferBond authorization MISSING" at startup
-**Cause**: `LPT_RECEIVER_ADDR` has not authorized the signer as a third-party bonder. Transfers keep working until Livepeer enforces the authorization, then every `transferBond` fails.
-**Solution**: From the receiver's wallet, call `setThirdPartyBonderAuthorization(<signer>, true)` on the BondingManager; see [Third-Party Bonder Authorization](#third-party-bonder-authorization). Restart the app to see the check pass.
+#### 7. "refusing to start: authorization missing"
+**Cause**: `ENABLE_TRANSFER_BOND=true`, and `LPT_RECEIVER_ADDR` has not authorized the signer as a third-party bonder. Once Livepeer enforces the authorization, every `transferBond` would fail, so the app stops at startup instead. No rewards are called while it is down.
+**Solution**: From the receiver's wallet, call `setThirdPartyBonderAuthorization(<signer>, true)` on the BondingManager, then restart; see [Third-Party Bonder Authorization](#third-party-bonder-authorization). To keep rewards and fee withdrawals running in the meantime, set `ENABLE_TRANSFER_BOND=false`.
+If the message is instead `isThirdPartyBonderAuthorized() failed`, the check could not reach the contract: see [Connection timeouts](#8-connection-timeouts).
 
 #### 8. Connection timeouts
 **Cause**: RPC endpoint unreachable or rate limited
