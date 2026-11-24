@@ -1,23 +1,31 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, time::Duration};
 
-use ethers::{
-    contract::ContractCall,
-    middleware::SignerMiddleware,
-    providers::{Http, Middleware, Provider},
-    signers::{LocalWallet, Signer},
-    types::{Address, BlockNumber, TxHash, U256, transaction::eip2718::TypedTransaction},
+use alloy::{
+    contract::{CallBuilder, CallDecoder},
+    eips::BlockNumberOrTag,
+    primitives::{Address, TxHash, U256},
+    providers::Provider,
+    rpc::client::RpcClient,
+    signers::local::PrivateKeySigner,
 };
 use livepeer_funds_transfer::{
+    client::{signing_provider, wait_for_receipt},
     config::{AppError, Config, load_config, validate_config},
-    contracts::{BondingManager, RoundsManager},
+    contracts::{BondingManager, BondingManagerInstance, RoundsManager, RoundsManagerInstance},
     reward_hints::compute_reward_hints,
 };
 use tokio::time::{sleep, timeout};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
+#[cfg(test)]
+#[path = "../mock_rpc.rs"]
+mod mock_rpc;
 #[cfg(test)]
 #[path = "funds_transfer/tests.rs"]
 mod tests;
+
+/// How often to poll for a sent tx's receipt (Arbitrum mines within about a second).
+const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RoundState {
@@ -53,22 +61,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.enable_withdraw_fees
     );
 
-    let provider = Provider::<Http>::try_from(cfg.http_rpc_url.as_str())
-        .map_err(|e| AppError::Provider(format!("{e}")))?;
-    // internal polling interval for provider housekeeping
-    let provider = provider.interval(Duration::from_millis(250));
+    let rpc_url = cfg
+        .http_rpc_url
+        .parse()
+        .map_err(|e| AppError::Provider(format!("invalid HTTP_RPC_URL: {e}")))?;
 
-    // load wallet (keystore + passphrase files)
-    let passphrase = std::fs::read_to_string(&cfg.passphrase_file)
-        .map_err(|e| AppError::Wallet(format!("failed to read PASSPHRASE_FILE: {e}")))?;
-    let passphrase = passphrase.trim_end();
-
-    let key_json_path = Path::new(&cfg.json_key_file);
-    let wallet = LocalWallet::decrypt_keystore(key_json_path, passphrase)
-        .map_err(|e| AppError::Wallet(format!("failed to decrypt JSON_KEY_FILE: {e}")))?
-        .with_chain_id(cfg.chain_id);
-
-    let signer_addr = wallet.address();
+    let signer = load_signer(&cfg)?;
+    let signer_addr = signer.address();
     let orchestrator_addr = cfg.orchestrator_addr.unwrap_or(signer_addr);
 
     if orchestrator_addr != signer_addr {
@@ -80,9 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("orchestrator/signer address: {:?}", orchestrator_addr);
     }
 
-    let client = Arc::new(SignerMiddleware::new(provider, wallet));
-    let rounds = RoundsManager::new(cfg.rounds_manager_addr, client.clone());
-    let bonding = BondingManager::new(cfg.bonding_manager_addr, client.clone());
+    let provider = signing_provider(RpcClient::new_http(rpc_url), signer, cfg.chain_id);
+    let rounds = RoundsManager::new(cfg.rounds_manager_addr, provider.clone());
+    let bonding = BondingManager::new(cfg.bonding_manager_addr, provider);
+
+    // Before the loop: refuse to start rather than run with transfers that will fail.
+    check_transfer_bond_authorization(&bonding, signer_addr, &cfg)
+        .await
+        .inspect_err(|e| error!("refusing to start: {e}"))?;
 
     let mut last_state: Option<RoundState> = None;
     let mut last_locked_snapshot: Option<LockedSnapshot> = None;
@@ -101,11 +105,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Decrypts the keystore at JSON_KEY_FILE with the passphrase in PASSPHRASE_FILE.
+///
+/// Errors name the path, so a wrong path or a volume mounted somewhere else is obvious from the
+/// log. The paths are configuration, not secrets.
+fn load_signer(cfg: &Config) -> Result<PrivateKeySigner, AppError> {
+    let passphrase = std::fs::read_to_string(&cfg.passphrase_file).map_err(|e| {
+        AppError::Wallet(format!(
+            "failed to read PASSPHRASE_FILE={}: {e}",
+            cfg.passphrase_file
+        ))
+    })?;
+    PrivateKeySigner::decrypt_keystore(Path::new(&cfg.json_key_file), passphrase.trim_end())
+        .map_err(|e| {
+            AppError::Wallet(format!(
+                "failed to decrypt JSON_KEY_FILE={}: {e}",
+                cfg.json_key_file
+            ))
+        })
+}
+
+/// Outcome of a passed startup third-party bonder authorization check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BondAuthorization {
+    /// transferBond is disabled, or the receiver is the signer itself (not a third party).
+    NotNeeded,
+    Authorized,
+}
+
+/// Checks that LPT_RECEIVER_ADDR has authorized the signer as a third-party bonder.
+///
+/// The signer sends transferBond, which bonds stake to the receiver: that makes the signer a
+/// third-party bonder for the receiver. Once the protocol enforces third-party bonding
+/// authorization, the transfer only succeeds if the receiver has called
+/// `setThirdPartyBonderAuthorization(signer, true)`.
+///
+/// Errors, so the app refuses to start, when the authorization is missing and also when the
+/// check itself fails (it cannot be confirmed). Under a restart policy a transient RPC error
+/// clears on the next start. Setting ENABLE_TRANSFER_BOND=false skips the check.
+async fn check_transfer_bond_authorization<P: Provider>(
+    bonding: &BondingManagerInstance<P>,
+    signer: Address,
+    cfg: &Config,
+) -> Result<BondAuthorization, AppError> {
+    let receiver = match cfg.lpt_receiver_addr {
+        Some(receiver) if cfg.enable_transfer_bond && receiver != signer => receiver,
+        _ => return Ok(BondAuthorization::NotNeeded),
+    };
+    let authorized = bonding
+        .isThirdPartyBonderAuthorized(receiver, signer)
+        .call()
+        .await
+        .map_err(|e| {
+            AppError::Contract(format!(
+                "isThirdPartyBonderAuthorized() failed: {e}; cannot confirm that LPT_RECEIVER_ADDR={receiver:?} \
+                 has authorized signer={signer:?} (set ENABLE_TRANSFER_BOND=false to run without transfers)"
+            ))
+        })?;
+    if !authorized {
+        return Err(AppError::Unauthorized(format!(
+            "LPT_RECEIVER_ADDR={receiver:?} has not authorized signer={signer:?} as a third-party bonder, so transferBond \
+             fails once the protocol enforces third-party bonding authorization. Fix: from {receiver:?}, call \
+             setThirdPartyBonderAuthorization({signer:?}, true) on BondingManager {:?}, then restart. \
+             To run without transfers, set ENABLE_TRANSFER_BOND=false.",
+            bonding.address()
+        )));
+    }
+    info!(
+        "transferBond authorization OK: LPT_RECEIVER_ADDR={receiver:?} has authorized signer={signer:?} as a third-party bonder"
+    );
+    Ok(BondAuthorization::Authorized)
+}
+
 /// One iteration of the main loop: read the round state, then run whatever actions it calls
 /// for. Errors are logged, never returned; the next iteration re-checks and retries.
-async fn poll_once<M: Middleware>(
-    rounds: &RoundsManager<M>,
-    bonding: &BondingManager<M>,
+async fn poll_once<P: Provider>(
+    rounds: &RoundsManagerInstance<P>,
+    bonding: &BondingManagerInstance<P>,
     orchestrator_addr: Address,
     cfg: &Config,
     last_state: &mut Option<RoundState>,
@@ -160,26 +236,22 @@ async fn poll_once<M: Middleware>(
     *last_state = Some(state);
 }
 
-async fn fetch_round_state<M: Middleware>(
-    rounds: &RoundsManager<M>,
+async fn fetch_round_state<P: Provider>(
+    rounds: &RoundsManagerInstance<P>,
 ) -> Result<RoundState, AppError> {
     let round = rounds
-        .current_round()
+        .currentRound()
         .call()
         .await
         .map_err(|e| AppError::Contract(format!("RoundsManager.currentRound() failed: {e}")))?;
 
-    let initialized = rounds
-        .current_round_initialized()
-        .call()
-        .await
-        .map_err(|e| {
-            AppError::Contract(format!(
-                "RoundsManager.currentRoundInitialized() failed: {e}"
-            ))
-        })?;
+    let initialized = rounds.currentRoundInitialized().call().await.map_err(|e| {
+        AppError::Contract(format!(
+            "RoundsManager.currentRoundInitialized() failed: {e}"
+        ))
+    })?;
 
-    let locked = rounds.current_round_locked().call().await.map_err(|e| {
+    let locked = rounds.currentRoundLocked().call().await.map_err(|e| {
         AppError::Contract(format!("RoundsManager.currentRoundLocked() failed: {e}"))
     })?;
 
@@ -192,21 +264,19 @@ async fn fetch_round_state<M: Middleware>(
 
 /// Calls bonding.rewardWithHint() ONLY if lastRewardRound < current_round.
 /// No internal retries: if tx fails, caller logs and next loop will retry.
-async fn maybe_reward_once_per_round<M: Middleware>(
-    bonding: &BondingManager<M>,
+async fn maybe_reward_once_per_round<P: Provider>(
+    bonding: &BondingManagerInstance<P>,
     orchestrator: Address,
     current_round: U256,
     cfg: &Config,
 ) -> Result<(), AppError> {
     let receipt_timeout_secs = cfg.receipt_timeout_secs;
-    // getTranscoder(addr) returns a tuple whose first element is lastRewardRound (per ABI)
-    let t = bonding
-        .get_transcoder(orchestrator)
+    let last_reward_round = bonding
+        .getTranscoder(orchestrator)
         .call()
         .await
-        .map_err(|e| AppError::Contract(format!("BondingManager.getTranscoder() failed: {e}")))?;
-
-    let last_reward_round: U256 = t.0;
+        .map_err(|e| AppError::Contract(format!("BondingManager.getTranscoder() failed: {e}")))?
+        .lastRewardRound;
 
     if last_reward_round >= current_round {
         debug!(
@@ -232,37 +302,36 @@ async fn maybe_reward_once_per_round<M: Middleware>(
         }
         Err(e) => {
             warn!("reward hint computation failed: {e}; sending rewardWithHint without hints");
-            (Address::zero(), Address::zero())
+            (Address::ZERO, Address::ZERO)
         }
     };
 
-    let call = with_l2_fees(
-        bonding.client_ref(),
-        bonding.reward_with_hint(prev, next),
-        cfg,
-    )
-    .await?;
+    let call = with_l2_fees(bonding.rewardWithHint(prev, next), cfg).await?;
     let pending = call
         .send()
         .await
         .map_err(|e| AppError::Tx(format!("rewardWithHint() send failed: {e}")))?;
 
-    let tx_hash: TxHash = *pending;
+    let tx_hash: TxHash = *pending.tx_hash();
     info!("reward tx sent: tx_hash={:?}", tx_hash);
 
     // Wait for receipt with a timeout so we don't hang forever.
-    match timeout(Duration::from_secs(receipt_timeout_secs), pending).await {
-        Ok(Ok(Some(receipt))) => {
+    match timeout(
+        Duration::from_secs(receipt_timeout_secs),
+        wait_for_receipt(bonding.provider(), tx_hash, RECEIPT_POLL_INTERVAL),
+    )
+    .await
+    {
+        Ok(Ok(receipt)) => {
             info!(
-                "reward tx confirmed: tx_hash={:?} status={:?} block={:?} gas_used={:?}",
-                receipt.transaction_hash, receipt.status, receipt.block_number, receipt.gas_used
+                "reward tx confirmed: tx_hash={:?} success={} block={:?} gas_used={}",
+                receipt.transaction_hash,
+                receipt.status(),
+                receipt.block_number,
+                receipt.gas_used
             );
             Ok(())
         }
-        Ok(Ok(None)) => Err(AppError::Tx(format!(
-            "reward tx pending returned None receipt: tx_hash={:?}",
-            tx_hash
-        ))),
         Ok(Err(e)) => Err(AppError::Tx(format!(
             "reward tx receipt error: tx_hash={:?} err={e}",
             tx_hash
@@ -274,44 +343,46 @@ async fn maybe_reward_once_per_round<M: Middleware>(
     }
 }
 
-/// Sets EIP-1559 fees from the latest base fee instead of ethers' default estimator.
+/// Sets EIP-1559 fees from the latest base fee instead of a client-side fee estimator.
 ///
-/// ethers assumes Ethereum mainnet and uses a minimum 3 gwei tip, which on Arbitrum
-/// (base fee ~0.01 gwei) inflates maxFeePerGas by 100x+. eth_estimateGas caps gas at
-/// balance / maxFeePerGas, so a modestly funded wallet intermittently fails with
-/// "gas required exceeds allowance". Arbitrum ignores the tip, so a zero tip is fine.
-async fn with_l2_fees<M: Middleware, D>(
-    client: &M,
-    mut call: ContractCall<M, D>,
+/// Mainnet-oriented estimators (ethers used a 3 gwei minimum tip) inflate maxFeePerGas by 100x+
+/// on Arbitrum (base fee ~0.01 gwei). eth_estimateGas caps gas at balance / maxFeePerGas, so a
+/// modestly funded wallet intermittently fails with "gas required exceeds allowance". Arbitrum
+/// ignores the tip, so a zero tip is fine. With both fees set, the provider only estimates gas.
+async fn with_l2_fees<P: Provider, D: CallDecoder>(
+    call: CallBuilder<P, D>,
     cfg: &Config,
-) -> Result<ContractCall<M, D>, AppError> {
-    let block = client
-        .get_block(BlockNumber::Latest)
+) -> Result<CallBuilder<P, D>, AppError> {
+    let block = call
+        .provider
+        .get_block_by_number(BlockNumberOrTag::Latest)
         .await
         .map_err(|e| AppError::Provider(format!("get_block(latest) failed: {e}")))?
         .ok_or_else(|| AppError::Provider("latest block not found".into()))?;
     let base_fee = block
+        .header
         .base_fee_per_gas
         .ok_or_else(|| AppError::Provider("latest block has no baseFeePerGas".into()))?;
 
     let priority_fee = cfg.max_priority_fee_wei;
-    let max_fee = base_fee * U256::from(cfg.max_fee_base_multiplier) + priority_fee;
-
-    if let TypedTransaction::Eip1559(ref mut inner) = call.tx {
-        inner.max_fee_per_gas = Some(max_fee);
-        inner.max_priority_fee_per_gas = Some(priority_fee);
-    }
+    let max_fee = U256::from(base_fee) * U256::from(cfg.max_fee_base_multiplier) + priority_fee;
 
     debug!(
         "tx fees: baseFeeWei={} maxFeePerGasWei={} maxPriorityFeePerGasWei={}",
         base_fee, max_fee, priority_fee
     );
 
-    Ok(call)
+    // alloy carries fees as u128; anything larger is not a real fee.
+    let to_u128 = |name: &str, v: U256| {
+        u128::try_from(v).map_err(|_| AppError::Provider(format!("{name} {v} exceeds u128")))
+    };
+    Ok(call
+        .max_fee_per_gas(to_u128("maxFeePerGas", max_fee)?)
+        .max_priority_fee_per_gas(to_u128("maxPriorityFeePerGas", priority_fee)?))
 }
 
-async fn handle_locked_round_actions<M: Middleware>(
-    bonding: &BondingManager<M>,
+async fn handle_locked_round_actions<P: Provider>(
+    bonding: &BondingManagerInstance<P>,
     orchestrator: Address,
     current_round: U256,
     cfg: &Config,
@@ -343,7 +414,7 @@ async fn handle_locked_round_actions<M: Middleware>(
         })?;
 
         let pending_stake = bonding
-            .pending_stake(orchestrator, current_round)
+            .pendingStake(orchestrator, current_round)
             .call()
             .await
             .map_err(|e| AppError::Contract(format!("pendingStake() failed: {e}")))?;
@@ -363,7 +434,7 @@ async fn handle_locked_round_actions<M: Middleware>(
                     "transferBond skipped: pendingStakeWei={} <= retainWei={} round={}",
                     pending_stake, retain, current_round
                 );
-                U256::zero()
+                U256::ZERO
             }
         };
 
@@ -374,14 +445,13 @@ async fn handle_locked_round_actions<M: Middleware>(
             );
 
             let call = with_l2_fees(
-                bonding.client_ref(),
-                bonding.transfer_bond(
+                bonding.transferBond(
                     receiver,
                     transferable,
-                    Address::zero(),
-                    Address::zero(),
-                    Address::zero(),
-                    Address::zero(),
+                    Address::ZERO,
+                    Address::ZERO,
+                    Address::ZERO,
+                    Address::ZERO,
                 ),
                 cfg,
             )
@@ -389,27 +459,26 @@ async fn handle_locked_round_actions<M: Middleware>(
 
             match call.send().await {
                 Ok(pending) => {
-                    let tx_hash = *pending;
+                    let tx_hash = *pending.tx_hash();
                     info!(
                         "transferBond tx sent: round={} tx_hash={:?}",
                         current_round, tx_hash
                     );
 
-                    match timeout(Duration::from_secs(cfg.receipt_timeout_secs), pending).await {
-                        Ok(Ok(Some(receipt))) => {
+                    match timeout(
+                        Duration::from_secs(cfg.receipt_timeout_secs),
+                        wait_for_receipt(bonding.provider(), tx_hash, RECEIPT_POLL_INTERVAL),
+                    )
+                    .await
+                    {
+                        Ok(Ok(receipt)) => {
                             info!(
-                                "transferBond confirmed: round={} tx_hash={:?} status={:?} block={:?} gas_used={:?}",
+                                "transferBond confirmed: round={} tx_hash={:?} success={} block={:?} gas_used={}",
                                 current_round,
                                 receipt.transaction_hash,
-                                receipt.status,
+                                receipt.status(),
                                 receipt.block_number,
                                 receipt.gas_used
-                            );
-                        }
-                        Ok(Ok(None)) => {
-                            warn!(
-                                "transferBond receipt missing (None): round={} tx_hash={:?}",
-                                current_round, tx_hash
                             );
                         }
                         Ok(Err(e)) => {
@@ -454,7 +523,7 @@ async fn handle_locked_round_actions<M: Middleware>(
         })?;
 
         let pending_fees = bonding
-            .pending_fees(orchestrator, current_round)
+            .pendingFees(orchestrator, current_round)
             .call()
             .await
             .map_err(|e| AppError::Contract(format!("pendingFees() failed: {e}")))?;
@@ -472,36 +541,30 @@ async fn handle_locked_round_actions<M: Middleware>(
                 current_round, orchestrator, receiver, pending_fees
             );
 
-            let call = with_l2_fees(
-                bonding.client_ref(),
-                bonding.withdraw_fees(receiver, pending_fees),
-                cfg,
-            )
-            .await?;
+            let call = with_l2_fees(bonding.withdrawFees(receiver, pending_fees), cfg).await?;
 
             match call.send().await {
                 Ok(pending) => {
-                    let tx_hash = *pending;
+                    let tx_hash = *pending.tx_hash();
                     info!(
                         "withdrawFees tx sent: round={} tx_hash={:?}",
                         current_round, tx_hash
                     );
 
-                    match timeout(Duration::from_secs(cfg.receipt_timeout_secs), pending).await {
-                        Ok(Ok(Some(receipt))) => {
+                    match timeout(
+                        Duration::from_secs(cfg.receipt_timeout_secs),
+                        wait_for_receipt(bonding.provider(), tx_hash, RECEIPT_POLL_INTERVAL),
+                    )
+                    .await
+                    {
+                        Ok(Ok(receipt)) => {
                             info!(
-                                "withdrawFees confirmed: round={} tx_hash={:?} status={:?} block={:?} gas_used={:?}",
+                                "withdrawFees confirmed: round={} tx_hash={:?} success={} block={:?} gas_used={}",
                                 current_round,
                                 receipt.transaction_hash,
-                                receipt.status,
+                                receipt.status(),
                                 receipt.block_number,
                                 receipt.gas_used
-                            );
-                        }
-                        Ok(Ok(None)) => {
-                            warn!(
-                                "withdrawFees receipt missing (None): round={} tx_hash={:?}",
-                                current_round, tx_hash
                             );
                         }
                         Ok(Err(e)) => {
@@ -536,8 +599,8 @@ async fn handle_locked_round_actions<M: Middleware>(
     // Emit a single INFO snapshot when the locked-round values change (not every loop).
     let snap = LockedSnapshot {
         round: current_round,
-        pending_stake: pending_stake_for_snapshot.unwrap_or_else(U256::zero),
-        pending_fees: pending_fees_for_snapshot.unwrap_or_else(U256::zero),
+        pending_stake: pending_stake_for_snapshot.unwrap_or_default(),
+        pending_fees: pending_fees_for_snapshot.unwrap_or_default(),
         stake_present: pending_stake_for_snapshot.is_some(),
         fees_present: pending_fees_for_snapshot.is_some(),
     };

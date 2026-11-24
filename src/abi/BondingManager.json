@@ -191,6 +191,31 @@
       {
         "indexed": true,
         "internalType": "address",
+        "name": "delegator",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "bonder",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "bool",
+        "name": "authorized",
+        "type": "bool"
+      }
+    ],
+    "name": "ThirdPartyBonderAuthorization",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
         "name": "transcoder",
         "type": "address"
       },
@@ -907,6 +932,30 @@
         "type": "address"
       },
       {
+        "internalType": "address",
+        "name": "_bonder",
+        "type": "address"
+      }
+    ],
+    "name": "isThirdPartyBonderAuthorized",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_delegator",
+        "type": "address"
+      },
+      {
         "internalType": "uint256",
         "name": "_unbondingLockId",
         "type": "uint256"
@@ -1182,6 +1231,24 @@
       }
     ],
     "name": "setRewardCaller",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_bonder",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "_authorized",
+        "type": "bool"
+      }
+    ],
+    "name": "setThirdPartyBonderAuthorization",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

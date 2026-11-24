@@ -13,21 +13,20 @@
 
 use std::fmt;
 
-use ethers::{
-    contract::ContractError,
-    providers::Middleware,
-    types::{Address, U256},
-    utils::keccak256,
+use alloy::{
+    contract::Error as ContractError,
+    primitives::{Address, U256, keccak256},
+    providers::Provider,
 };
 
-use crate::contracts::{BondingManager, Controller, Minter};
+use crate::contracts::{BondingManagerInstance, Controller, Minter};
 
 /// MathUtilsV2.PERC_DIVISOR, used by Minter.createReward.
 const MINTER_PERC_DIVISOR: u64 = 1_000_000_000;
 
 /// PreciseMathUtils.PERC_DIVISOR, used for treasuryRewardCutRate.
 fn precise_perc_divisor() -> U256 {
-    U256::exp10(27)
+    U256::from(10u64).pow(U256::from(27u64))
 }
 
 /// On-chain values that determine the reward minted for a transcoder.
@@ -46,7 +45,7 @@ pub struct RewardInputs {
 /// Stake the transcoder gains from reward(): Minter.createReward minus the treasury cut.
 pub fn expected_transcoder_reward(inputs: &RewardInputs) -> U256 {
     if inputs.total_active_stake.is_zero() {
-        return U256::zero();
+        return U256::ZERO;
     }
     let divisor = U256::from(MINTER_PERC_DIVISOR);
     // MathUtilsV2.percOf(amount, num, denom) = amount * (num * D / denom) / D
@@ -76,19 +75,19 @@ pub trait PoolSource {
     async fn stake(&self, id: Address) -> Result<U256, Self::Error>;
 }
 
-impl<M: Middleware> PoolSource for BondingManager<M> {
-    type Error = ContractError<M>;
+impl<P: Provider> PoolSource for BondingManagerInstance<P> {
+    type Error = ContractError;
 
     async fn first(&self) -> Result<Address, Self::Error> {
-        self.get_first_transcoder_in_pool().call().await
+        self.getFirstTranscoderInPool().call().await
     }
 
     async fn next(&self, id: Address) -> Result<Address, Self::Error> {
-        self.get_next_transcoder_in_pool(id).call().await
+        self.getNextTranscoderInPool(id).call().await
     }
 
     async fn stake(&self, id: Address) -> Result<U256, Self::Error> {
-        self.transcoder_total_stake(id).call().await
+        self.transcoderTotalStake(id).call().await
     }
 }
 
@@ -128,7 +127,7 @@ pub async fn find_insert_hints<P: PoolSource>(
     new_stake: U256,
     max_nodes: usize,
 ) -> Result<(Address, Address), HintError<P::Error>> {
-    let mut prev = Address::zero();
+    let mut prev = Address::ZERO;
     let mut id = pool.first().await?;
     let mut visited = 0usize;
 
@@ -146,7 +145,7 @@ pub async fn find_insert_hints<P: PoolSource>(
         id = pool.next(id).await?;
     }
 
-    Ok((prev, Address::zero()))
+    Ok((prev, Address::ZERO))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,36 +157,35 @@ pub struct RewardHints {
 }
 
 /// Reads the reward inputs and pool from chain and computes hints for `transcoder`.
-pub async fn compute_reward_hints<M: Middleware>(
-    bonding: &BondingManager<M>,
+pub async fn compute_reward_hints<P: Provider>(
+    bonding: &BondingManagerInstance<P>,
     transcoder: Address,
     current_round: U256,
-) -> Result<RewardHints, HintError<ContractError<M>>> {
-    let client = bonding.client();
+) -> Result<RewardHints, HintError<ContractError>> {
+    let provider = bonding.provider();
     // Resolve the Minter through the Controller each time; it can be upgraded.
-    let controller = Controller::new(bonding.controller().call().await?, client.clone());
-    let minter_addr = controller.get_contract(keccak256("Minter")).call().await?;
-    let minter = Minter::new(minter_addr, client);
+    let controller = Controller::new(bonding.controller().call().await?, provider);
+    let minter_addr = controller.getContract(keccak256("Minter")).call().await?;
+    let minter = Minter::new(minter_addr, provider);
 
-    let t = bonding.get_transcoder(transcoder).call().await?;
-    let last_active_stake_update_round = t.3;
-    let pool_round = earnings_pool_round(last_active_stake_update_round, current_round);
+    let t = bonding.getTranscoder(transcoder).call().await?;
+    let pool_round = earnings_pool_round(t.lastActiveStakeUpdateRound, current_round);
     let earnings_pool = bonding
-        .get_transcoder_earnings_pool_for_round(transcoder, pool_round)
+        .getTranscoderEarningsPoolForRound(transcoder, pool_round)
         .call()
         .await?;
 
     let inputs = RewardInputs {
-        mintable_tokens: minter.current_mintable_tokens().call().await?,
-        earnings_pool_stake: earnings_pool.0,
-        total_active_stake: bonding.current_round_total_active_stake().call().await?,
-        treasury_reward_cut_rate: bonding.treasury_reward_cut_rate().call().await?,
+        mintable_tokens: minter.currentMintableTokens().call().await?,
+        earnings_pool_stake: earnings_pool.totalStake,
+        total_active_stake: bonding.currentRoundTotalActiveStake().call().await?,
+        treasury_reward_cut_rate: bonding.treasuryRewardCutRate().call().await?,
     };
     let expected_reward = expected_transcoder_reward(&inputs);
 
-    let current_stake = bonding.transcoder_total_stake(transcoder).call().await?;
-    let max_nodes = bonding.get_transcoder_pool_max_size().call().await?;
-    let max_nodes = usize::try_from(max_nodes.low_u64()).unwrap_or(usize::MAX);
+    let current_stake = bonding.transcoderTotalStake(transcoder).call().await?;
+    let max_nodes = bonding.getTranscoderPoolMaxSize().call().await?;
+    let max_nodes = max_nodes.saturating_to::<usize>();
 
     let (prev, next) = find_insert_hints(
         bonding,
@@ -214,11 +212,15 @@ mod tests {
     use super::*;
 
     fn addr(n: u64) -> Address {
-        Address::from_low_u64_be(n)
+        Address::left_padding_from(&n.to_be_bytes())
     }
 
     fn wei(s: &str) -> U256 {
-        U256::from_dec_str(s).unwrap()
+        U256::from_str_radix(s, 10).unwrap()
+    }
+
+    fn u(n: u64) -> U256 {
+        U256::from(n)
     }
 
     fn block_on<F: Future>(f: F) -> F::Output {
@@ -272,7 +274,7 @@ mod tests {
         let list: Vec<_> = nodes.iter().copied().filter(|(a, _)| *a != me).collect();
         let pos = |id: Address| list.iter().position(|(a, _)| *a == id);
         let key_of = |id: Address| list[pos(id).unwrap()].1;
-        let zero = Address::zero();
+        let zero = Address::ZERO;
 
         if prev == zero && next == zero {
             list.is_empty()
@@ -324,7 +326,7 @@ mod tests {
                 mintable_tokens: wei(R4371_MINTABLE),
                 earnings_pool_stake: wei(pool_stake),
                 total_active_stake: wei(R4371_TOTAL_ACTIVE),
-                treasury_reward_cut_rate: U256::zero(),
+                treasury_reward_cut_rate: U256::ZERO,
             };
             assert_eq!(expected_transcoder_reward(&inputs), wei(event_amount));
         }
@@ -337,7 +339,7 @@ mod tests {
             mintable_tokens: wei(R4371_MINTABLE),
             earnings_pool_stake: wei("8251085550154983237942"),
             total_active_stake: wei(R4371_TOTAL_ACTIVE),
-            treasury_reward_cut_rate: U256::zero(),
+            treasury_reward_cut_rate: U256::ZERO,
         };
         let exact = inputs.mintable_tokens * inputs.earnings_pool_stake / inputs.total_active_stake;
         assert_eq!(
@@ -350,40 +352,31 @@ mod tests {
     fn reward_subtracts_treasury_cut() {
         // 10% cut (1e26 / 1e27). Minted = 1000 * (250e9 / 1000) / 1e9 = 250, treasury = 25.
         let inputs = RewardInputs {
-            mintable_tokens: U256::from(1000u64),
-            earnings_pool_stake: U256::from(250u64),
-            total_active_stake: U256::from(1000u64),
-            treasury_reward_cut_rate: U256::exp10(26),
+            mintable_tokens: u(1000),
+            earnings_pool_stake: u(250),
+            total_active_stake: u(1000),
+            treasury_reward_cut_rate: U256::from(10u64).pow(u(26)),
         };
-        assert_eq!(expected_transcoder_reward(&inputs), U256::from(225u64));
+        assert_eq!(expected_transcoder_reward(&inputs), u(225));
     }
 
     #[test]
     fn reward_is_zero_without_active_stake() {
         let inputs = RewardInputs {
-            mintable_tokens: U256::from(1000u64),
-            earnings_pool_stake: U256::from(250u64),
-            total_active_stake: U256::zero(),
-            treasury_reward_cut_rate: U256::zero(),
+            mintable_tokens: u(1000),
+            earnings_pool_stake: u(250),
+            total_active_stake: U256::ZERO,
+            treasury_reward_cut_rate: U256::ZERO,
         };
-        assert_eq!(expected_transcoder_reward(&inputs), U256::zero());
+        assert_eq!(expected_transcoder_reward(&inputs), U256::ZERO);
     }
 
     #[test]
     fn earnings_pool_round_uses_last_update_when_stale() {
-        assert_eq!(
-            earnings_pool_round(4300.into(), 4371.into()),
-            U256::from(4300)
-        );
-        assert_eq!(
-            earnings_pool_round(4371.into(), 4371.into()),
-            U256::from(4371)
-        );
+        assert_eq!(earnings_pool_round(u(4300), u(4371)), U256::from(4300));
+        assert_eq!(earnings_pool_round(u(4371), u(4371)), U256::from(4371));
         // Stake changed this round: lastActiveStakeUpdateRound is already current + 1.
-        assert_eq!(
-            earnings_pool_round(4372.into(), 4371.into()),
-            U256::from(4371)
-        );
+        assert_eq!(earnings_pool_round(u(4372), u(4371)), U256::from(4371));
     }
 
     // ---------------------------------------------------------------
@@ -394,44 +387,41 @@ mod tests {
     fn hints_stay_in_place_when_reward_does_not_pass_anyone() {
         let p = pool(&[500, 400, 300, 200]);
         // addr(3) goes 300 -> 310: still between 400 and 200.
-        assert_eq!(hints(&p, addr(3), 310.into()), (addr(2), addr(4)));
+        assert_eq!(hints(&p, addr(3), u(310)), (addr(2), addr(4)));
     }
 
     #[test]
     fn hints_move_up_when_reward_passes_a_neighbour() {
         let p = pool(&[500, 400, 300, 200]);
-        assert_eq!(hints(&p, addr(3), 450.into()), (addr(1), addr(2)));
+        assert_eq!(hints(&p, addr(3), u(450)), (addr(1), addr(2)));
     }
 
     #[test]
     fn hints_for_new_head() {
         let p = pool(&[500, 400, 300]);
-        assert_eq!(hints(&p, addr(3), 600.into()), (Address::zero(), addr(1)));
+        assert_eq!(hints(&p, addr(3), u(600)), (Address::ZERO, addr(1)));
         // Already the head and staying there.
-        assert_eq!(hints(&p, addr(1), 510.into()), (Address::zero(), addr(2)));
+        assert_eq!(hints(&p, addr(1), u(510)), (Address::ZERO, addr(2)));
     }
 
     #[test]
     fn hints_for_tail() {
         let p = pool(&[500, 400, 300]);
-        assert_eq!(hints(&p, addr(3), 301.into()), (addr(2), Address::zero()));
+        assert_eq!(hints(&p, addr(3), u(301)), (addr(2), Address::ZERO));
     }
 
     #[test]
     fn hints_for_only_member() {
         let p = pool(&[500]);
-        assert_eq!(
-            hints(&p, addr(1), 600.into()),
-            (Address::zero(), Address::zero())
-        );
+        assert_eq!(hints(&p, addr(1), u(600)), (Address::ZERO, Address::ZERO));
     }
 
     #[test]
     fn hints_with_equal_stake_go_after_the_tie() {
         let p = pool(&[500, 400, 400, 100]);
-        let (prev, next) = hints(&p, addr(4), 400.into());
-        assert_eq!((prev, next), (addr(3), Address::zero()));
-        assert!(valid_insert_position(&p, addr(4), 400.into(), prev, next));
+        let (prev, next) = hints(&p, addr(4), u(400));
+        assert_eq!((prev, next), (addr(3), Address::ZERO));
+        assert!(valid_insert_position(&p, addr(4), u(400), prev, next));
     }
 
     #[test]
@@ -452,7 +442,7 @@ mod tests {
         }
         let p = VecPool::new(&pool(&[500, 400, 300, 200, 100, 50]));
         let counting = Counting(&p, Default::default());
-        block_on(find_insert_hints(&counting, addr(2), 410.into(), 100)).unwrap();
+        block_on(find_insert_hints(&counting, addr(2), u(410), 100)).unwrap();
         // Reads 500 then 300 (skipping itself) and stops.
         assert_eq!(counting.1.get(), 2);
     }
@@ -460,7 +450,7 @@ mod tests {
     #[test]
     fn walk_errors_past_max_nodes() {
         let p = VecPool::new(&pool(&[500, 400, 300]));
-        let err = block_on(find_insert_hints(&p, addr(9), 1.into(), 2)).unwrap_err();
+        let err = block_on(find_insert_hints(&p, addr(9), u(1), 2)).unwrap_err();
         assert!(matches!(err, HintError::PoolTooLong(2)));
     }
 
@@ -507,22 +497,15 @@ mod tests {
     }
 }
 
-/// `compute_reward_hints` against a scripted JSON-RPC provider.
+/// `compute_reward_hints` against a scripted JSON-RPC transport.
 #[cfg(test)]
 mod rpc_tests {
-    use std::sync::Arc;
-
-    use ethers::{
-        abi::{Token, encode},
-        contract::ContractCall,
-        providers::{JsonRpcError, MockProvider, MockResponse, Provider},
-        types::{BlockNumber, Bytes},
-        utils::serialize,
-    };
+    use alloy::{primitives::Bytes, providers::RootProvider, sol_types::SolValue};
 
     use super::*;
+    use crate::{contracts::BondingManager, mock_rpc::MockRpc};
 
-    type Client = Provider<MockProvider>;
+    type Bonding = BondingManagerInstance<RootProvider>;
 
     const BONDING: u64 = 0xb0;
     const CONTROLLER: u64 = 0xc0;
@@ -530,182 +513,140 @@ mod rpc_tests {
     const ME: u64 = 3;
 
     fn addr(n: u64) -> Address {
-        Address::from_low_u64_be(n)
+        Address::left_padding_from(&n.to_be_bytes())
     }
 
-    fn setup() -> (BondingManager<Client>, Arc<Client>, MockProvider) {
-        let (provider, mock) = Provider::mocked();
-        let client = Arc::new(provider);
-        (
-            BondingManager::new(addr(BONDING), client.clone()),
-            client,
-            mock,
-        )
+    fn u(n: u64) -> U256 {
+        U256::from(n)
     }
 
-    /// MockProvider pops responses from the back, so push them in reverse call order.
-    fn script(mock: &MockProvider, responses: Vec<MockResponse>) {
-        for r in responses.into_iter().rev() {
-            mock.push_response(r);
+    fn setup() -> (Bonding, MockRpc) {
+        let mock = MockRpc::new();
+        let provider = RootProvider::new(mock.client());
+        (BondingManager::new(addr(BONDING), provider), mock)
+    }
+
+    fn enc<T: SolValue>(value: T) -> Bytes {
+        value.abi_encode().into()
+    }
+
+    /// eth_call results for the nine reads before the pool walk, up to and including
+    /// getTranscoderPoolMaxSize. EarningsPool.totalStake 250 of 1000 active, 1000 mintable,
+    /// 10% treasury cut: reward = 250 - 25 = 225. Current stake is 300.
+    fn inputs(last_active_round: u64, max_pool: U256) -> Vec<Bytes> {
+        let mut t = [U256::ZERO; 10];
+        t[0] = u(4370);
+        t[3] = u(last_active_round);
+        vec![
+            enc(addr(CONTROLLER)),
+            enc(addr(MINTER)),
+            enc(t),
+            enc([u(250), U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO]),
+            enc(u(1000)),
+            enc(u(1000)),
+            enc(U256::from(10u64).pow(u(26))),
+            enc(u(300)),
+            enc(max_pool),
+        ]
+    }
+
+    fn script(mock: &MockRpc, results: &[Bytes]) {
+        for r in results {
+            mock.ok("eth_call", r);
         }
     }
 
-    /// ABI-encoded eth_call return data.
-    fn ret(tokens: &[Token]) -> MockResponse {
-        MockResponse::Value(serialize(&Bytes::from(encode(tokens))))
-    }
-
-    fn uint(n: u64) -> Token {
-        Token::Uint(n.into())
-    }
-
-    fn address(a: Address) -> Token {
-        Token::Address(a)
-    }
-
-    fn rpc_error() -> MockResponse {
-        MockResponse::Error(JsonRpcError {
-            code: -32000,
-            message: "boom".into(),
-            data: None,
-        })
-    }
-
-    /// getTranscoder() return values with the given lastActiveStakeUpdateRound.
-    fn transcoder(last_active_stake_update_round: u64) -> MockResponse {
-        let mut t = vec![uint(0); 10];
-        t[0] = uint(4370);
-        t[3] = uint(last_active_stake_update_round);
-        ret(&t)
-    }
-
-    fn earnings_pool(total_stake: u64) -> MockResponse {
-        ret(&[uint(total_stake), uint(0), uint(0), uint(0), uint(0)])
-    }
-
-    /// Asserts the next request is an eth_call of `call` at the latest block.
-    fn expect_call<D>(mock: &MockProvider, call: &ContractCall<Client, D>) {
-        mock.assert_request(
-            "eth_call",
-            [serialize(&call.tx), serialize(&BlockNumber::Latest)],
-        )
-        .unwrap();
-    }
-
-    /// Responses up to and including getTranscoderPoolMaxSize (before the pool walk).
-    fn inputs(last_active_round: u64, max_pool: u64) -> Vec<MockResponse> {
-        vec![
-            ret(&[address(addr(CONTROLLER))]),
-            ret(&[address(addr(MINTER))]),
-            transcoder(last_active_round),
-            // EarningsPool.totalStake 250 of 1000 active, 1000 mintable, 10% treasury cut:
-            // reward = 250 - 25 = 225.
-            earnings_pool(250),
-            ret(&[uint(1000)]),
-            ret(&[uint(1000)]),
-            ret(&[Token::Uint(U256::exp10(26))]),
-            ret(&[uint(300)]),
-            ret(&[uint(max_pool)]),
-        ]
+    /// Asserts the nine input reads, with the earnings pool read for `pool_round`.
+    fn expect_inputs(bonding: &Bonding, mock: &MockRpc, pool_round: u64) {
+        let provider = bonding.provider();
+        let controller = Controller::new(addr(CONTROLLER), provider);
+        let minter = Minter::new(addr(MINTER), provider);
+        mock.expect_call(&bonding.controller());
+        mock.expect_call(&controller.getContract(keccak256("Minter")));
+        mock.expect_call(&bonding.getTranscoder(addr(ME)));
+        mock.expect_call(&bonding.getTranscoderEarningsPoolForRound(addr(ME), u(pool_round)));
+        mock.expect_call(&minter.currentMintableTokens());
+        mock.expect_call(&bonding.currentRoundTotalActiveStake());
+        mock.expect_call(&bonding.treasuryRewardCutRate());
+        mock.expect_call(&bonding.transcoderTotalStake(addr(ME)));
+        mock.expect_call(&bonding.getTranscoderPoolMaxSize());
     }
 
     #[tokio::test]
     async fn computes_hints_from_chain_state() {
-        let (bonding, client, mock) = setup();
+        let (bonding, mock) = setup();
         // Pool: 1=500, 2=400, me=300, 4=200. 300 + 225 = 525 passes everyone.
-        let mut responses = inputs(4300, 100);
-        responses.extend([ret(&[address(addr(1))]), ret(&[uint(500)])]);
-        script(&mock, responses);
+        script(&mock, &inputs(4300, u(100)));
+        mock.ret(addr(1));
+        mock.ret(u(500));
 
-        let hints = compute_reward_hints(&bonding, addr(ME), 4371.into())
+        let hints = compute_reward_hints(&bonding, addr(ME), u(4371))
             .await
             .unwrap();
         assert_eq!(
             hints,
             RewardHints {
-                prev: Address::zero(),
+                prev: Address::ZERO,
                 next: addr(1),
-                current_stake: 300.into(),
-                expected_reward: 225.into(),
+                current_stake: u(300),
+                expected_reward: u(225),
             }
         );
 
         // The Minter is resolved through the Controller the BondingManager reports, and the
         // earnings pool is read for lastActiveStakeUpdateRound (stale stake).
-        let controller = Controller::new(addr(CONTROLLER), client.clone());
-        let minter = Minter::new(addr(MINTER), client);
-        expect_call(&mock, &bonding.controller());
-        expect_call(&mock, &controller.get_contract(keccak256("Minter")));
-        expect_call(&mock, &bonding.get_transcoder(addr(ME)));
-        expect_call(
-            &mock,
-            &bonding.get_transcoder_earnings_pool_for_round(addr(ME), 4300.into()),
-        );
-        expect_call(&mock, &minter.current_mintable_tokens());
-        expect_call(&mock, &bonding.current_round_total_active_stake());
-        expect_call(&mock, &bonding.treasury_reward_cut_rate());
-        expect_call(&mock, &bonding.transcoder_total_stake(addr(ME)));
-        expect_call(&mock, &bonding.get_transcoder_pool_max_size());
-        expect_call(&mock, &bonding.get_first_transcoder_in_pool());
-        expect_call(&mock, &bonding.transcoder_total_stake(addr(1)));
-        assert!(
-            mock.assert_request("eth_call", ()).is_err(),
-            "no more requests"
-        );
+        expect_inputs(&bonding, &mock, 4300);
+        mock.expect_call(&bonding.getFirstTranscoderInPool());
+        mock.expect_call(&bonding.transcoderTotalStake(addr(1)));
+        mock.expect_no_more_requests();
     }
 
     #[tokio::test]
     async fn uses_current_round_pool_when_stake_updated_this_round() {
-        let (bonding, client, mock) = setup();
+        let (bonding, mock) = setup();
         // lastActiveStakeUpdateRound = current + 1 -> pool for the current round.
-        let mut responses = inputs(4372, 100);
+        script(&mock, &inputs(4372, u(100)));
         // Walk: 1=600 stays ahead, me skipped, 4=200 is below 525.
-        responses.extend([
-            ret(&[address(addr(1))]),
-            ret(&[uint(600)]),
-            ret(&[address(addr(ME))]),
-            ret(&[address(addr(4))]),
-            ret(&[uint(200)]),
-        ]);
-        script(&mock, responses);
+        mock.ret(addr(1));
+        mock.ret(u(600));
+        mock.ret(addr(ME));
+        mock.ret(addr(4));
+        mock.ret(u(200));
 
-        let hints = compute_reward_hints(&bonding, addr(ME), 4371.into())
+        let hints = compute_reward_hints(&bonding, addr(ME), u(4371))
             .await
             .unwrap();
         assert_eq!((hints.prev, hints.next), (addr(1), addr(4)));
 
-        let controller = Controller::new(addr(CONTROLLER), client);
-        expect_call(&mock, &bonding.controller());
-        expect_call(&mock, &controller.get_contract(keccak256("Minter")));
-        expect_call(&mock, &bonding.get_transcoder(addr(ME)));
-        expect_call(
-            &mock,
-            &bonding.get_transcoder_earnings_pool_for_round(addr(ME), 4371.into()),
-        );
+        expect_inputs(&bonding, &mock, 4371);
+        mock.expect_call(&bonding.getFirstTranscoderInPool());
+        mock.expect_call(&bonding.transcoderTotalStake(addr(1)));
+        mock.expect_call(&bonding.getNextTranscoderInPool(addr(1)));
+        mock.expect_call(&bonding.getNextTranscoderInPool(addr(ME)));
+        mock.expect_call(&bonding.transcoderTotalStake(addr(4)));
+        mock.expect_no_more_requests();
     }
 
     #[tokio::test]
     async fn empty_pool_gives_zero_hints() {
-        let (bonding, _client, mock) = setup();
-        let mut responses = inputs(4371, 100);
-        responses.push(ret(&[address(Address::zero())]));
-        script(&mock, responses);
+        let (bonding, mock) = setup();
+        script(&mock, &inputs(4371, u(100)));
+        mock.ret(Address::ZERO);
 
-        let hints = compute_reward_hints(&bonding, addr(ME), 4371.into())
+        let hints = compute_reward_hints(&bonding, addr(ME), u(4371))
             .await
             .unwrap();
-        assert_eq!((hints.prev, hints.next), (Address::zero(), Address::zero()));
-        assert_eq!(hints.expected_reward, U256::from(225));
+        assert_eq!((hints.prev, hints.next), (Address::ZERO, Address::ZERO));
+        assert_eq!(hints.expected_reward, u(225));
     }
 
     #[tokio::test]
     async fn pool_max_size_bounds_the_walk() {
-        let (bonding, _client, mock) = setup();
-        let mut responses = inputs(4371, 0);
-        responses.push(ret(&[address(addr(1))]));
-        script(&mock, responses);
+        let (bonding, mock) = setup();
+        script(&mock, &inputs(4371, U256::ZERO));
+        mock.ret(addr(1));
 
-        let err = compute_reward_hints(&bonding, addr(ME), 4371.into())
+        let err = compute_reward_hints(&bonding, addr(ME), u(4371))
             .await
             .unwrap_err();
         assert!(matches!(err, HintError::PoolTooLong(0)), "{err}");
@@ -713,17 +654,31 @@ mod rpc_tests {
     }
 
     #[tokio::test]
+    async fn oversized_pool_max_size_saturates() {
+        // 2^64 must not truncate to a 0-node bound (which would fail the walk).
+        let (bonding, mock) = setup();
+        script(&mock, &inputs(4371, U256::from(1u64) << 64));
+        mock.ret(addr(1));
+        mock.ret(u(100));
+        mock.ret(Address::ZERO);
+
+        let hints = compute_reward_hints(&bonding, addr(ME), u(4371))
+            .await
+            .unwrap();
+        assert_eq!((hints.prev, hints.next), (Address::ZERO, addr(1)));
+    }
+
+    #[tokio::test]
     async fn rpc_errors_are_returned_at_every_step() {
         // Fail each of the nine input reads, plus the first pool read.
         for fail_at in 0..10 {
-            let (bonding, _client, mock) = setup();
-            let mut responses = inputs(4371, 100);
-            responses.push(ret(&[address(addr(1))]));
-            responses.truncate(fail_at);
-            responses.push(rpc_error());
-            script(&mock, responses);
+            let (bonding, mock) = setup();
+            let mut results = inputs(4371, u(100));
+            results.push(enc(addr(1)));
+            script(&mock, &results[..fail_at]);
+            mock.err("eth_call");
 
-            let err = compute_reward_hints(&bonding, addr(ME), 4371.into())
+            let err = compute_reward_hints(&bonding, addr(ME), u(4371))
                 .await
                 .unwrap_err();
             assert!(matches!(err, HintError::Source(_)), "step {fail_at}: {err}");
@@ -733,10 +688,10 @@ mod rpc_tests {
 
     #[tokio::test]
     async fn malformed_return_data_is_an_error() {
-        let (bonding, _client, mock) = setup();
+        let (bonding, mock) = setup();
         // controller() returns no data.
-        script(&mock, vec![ret(&[])]);
-        let err = compute_reward_hints(&bonding, addr(ME), 4371.into())
+        mock.ret_empty();
+        let err = compute_reward_hints(&bonding, addr(ME), u(4371))
             .await
             .unwrap_err();
         assert!(matches!(err, HintError::Source(_)));

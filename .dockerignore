@@ -1,5 +1,6 @@
-.env
-*.env*
-target/
-.gitignore
-keys/
+# Allow-list: the image build gets only what `cargo install` needs. Everything else stays out,
+# including keys/, .env*, *-stack.json (RPC API keys), target/ (several GB), .git and tests/.
+*
+!Cargo.toml
+!Cargo.lock
+!src/

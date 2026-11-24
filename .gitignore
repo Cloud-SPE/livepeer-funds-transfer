@@ -1,8 +1,21 @@
+# Build output
 target/
-keys/
-*.env*
 **/*.rs.bk
 *.log
+
+# Secrets: never commit keys, passphrases, env files or deployment stacks (they carry RPC API keys)
+keys/
 *.env
+*.env*
+*-stack.json
+*keystore*.json
+UTC--*
+eth-secret*
+*passphrase*.txt
+*.pem
+*.key
+
+# Editors and OS files
 .idea/
 .vscode/
+.DS_Store

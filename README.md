@@ -42,8 +42,11 @@ livepeer-funds-transfer/
 │   ├── bin/
 │   │   └── funds_transfer.rs    # Main application logic
 │   ├── lib.rs
-│   ├── contracts.rs             # abigen bindings
+│   ├── client.rs                # signing provider + receipt polling
+│   ├── config.rs                # environment configuration
+│   ├── contracts.rs             # alloy sol! bindings
 │   ├── reward_hints.rs          # rewardWithHint position hints + reward math
+│   ├── mock_rpc.rs              # scripted JSON-RPC transport (tests only)
 │   └── abi/                     # From livepeer/protocol deployments/arbitrumMainnet
 │       ├── BondingManager.json
 │       ├── Controller.json
@@ -56,12 +59,9 @@ livepeer-funds-transfer/
 
 ### Key Dependencies
 
-- **tokio**: Async runtime for concurrent operations
-- **ethers**: Ethereum/Arbitrum blockchain interaction library
-- **dotenv**: Environment variable management
-- **serde/serde_json**: Serialization/deserialization
-- **tracing**: Structured logging and diagnostics
-- **chrono**: Date and time utilities
+- **alloy**: Ethereum/Arbitrum contract bindings (`sol!`), JSON-RPC provider, local keystore signing
+- **tokio**: Async runtime
+- **tracing** / **tracing-subscriber**: Structured logging and diagnostics
 
 ### Smart Contract Integration
 
@@ -119,7 +119,9 @@ source $HOME/.cargo/env
 
 ### Environment Variables
 
-Create a `.env` file in the project root with the following variables:
+Configuration is read from environment variables only; the binary does not load a `.env`
+file itself. Keeping them in a `.env` file works with Docker (`--env-file .env`, or `env_file:`
+in Compose) or by exporting it into your shell (see [Local Execution](#local-execution)):
 
 ```bash
 # Logging configuration
@@ -161,7 +163,7 @@ LOOP_SLEEP_SECS=60
 
 ### Configuration Details
 
-#### RPC_ENDPOINT_URL
+#### HTTP_RPC_URL
 - Public Arbitrum RPC: `https://arb1.arbitrum.io/rpc`
 - Consider using a dedicated RPC provider (Infura, Alchemy, QuickNode) for production
 - Rate limits may apply to public endpoints
@@ -184,9 +186,31 @@ LOOP_SLEEP_SECS=60
 
 #### Address Configuration
 
-- **ORCH_ETH_ADDR**: The orchestrator wallet that holds bonded LPT and accumulates fees
-- **TRANSFER_BOND_RECIPIENT_ETH_ADDR**: Destination for transferred LPT bonds (typically your main staking wallet)
-- **ETH_FEE_RECIPIENT_ETH_ADDR**: Destination for withdrawn ETH fees (can be the same as bond recipient)
+- **ORCHESTRATOR_ADDR** (optional): The orchestrator wallet that holds bonded LPT and accumulates fees. Defaults to the keystore's address.
+- **LPT_RECEIVER_ADDR**: Destination for transferred LPT bonds (typically your main staking wallet)
+- **ETH_FEE_RECEIVER_ADDR**: Destination for withdrawn ETH fees (can be the same as bond recipient)
+
+#### Third-Party Bonder Authorization
+
+`transferBond` bonds the signer's stake to `LPT_RECEIVER_ADDR`, which makes the signer a third-party bonder for that receiver. Once Livepeer enforces third-party bonding authorization ([forum post](https://forum.livepeer.org/t/upcoming-breaking-protocol-change-third-party-bonding-will-require-authorization/3401)), the transfer only succeeds if the receiver has authorized the signer. The receiver does this once, from its own wallet, on the BondingManager proxy `0x35Bcf3c30594191d53231E4FF333E8A770453e40`:
+
+```
+setThirdPartyBonderAuthorization(<signer address>, true)
+```
+
+When `ENABLE_TRANSFER_BOND=true`, the app checks `isThirdPartyBonderAuthorized(LPT_RECEIVER_ADDR, signer)` at startup, before the main loop. If the authorization is in place it logs:
+
+```
+INFO funds_transfer: transferBond authorization OK: LPT_RECEIVER_ADDR=0x… has authorized signer=0x… as a third-party bonder
+```
+
+If it is missing, the app **refuses to start** (exit code 1, before any transaction) and says how to fix it:
+
+```
+ERROR funds_transfer: refusing to start: authorization missing: LPT_RECEIVER_ADDR=0x… has not authorized signer=0x… as a third-party bonder, so transferBond fails once the protocol enforces third-party bonding authorization. Fix: from 0x…, call setThirdPartyBonderAuthorization(0x…, true) on BondingManager 0x…, then restart. To run without transfers, set ENABLE_TRANSFER_BOND=false.
+```
+
+It also refuses to start when the check itself fails (for example an RPC error), since the authorization cannot be confirmed. Under `restart: unless-stopped` Docker retries, so a brief RPC outage clears on its own. While the app is not running, it calls no rewards either, so fix the authorization promptly, or set `ENABLE_TRANSFER_BOND=false` to keep rewards and fee withdrawals running without transfers. The check is skipped when transfers are disabled or `LPT_RECEIVER_ADDR` is the signer itself.
 
 #### Operational Parameters
 
@@ -259,10 +283,9 @@ test checks that hints always satisfy `SortedDoublyLL.validInsertPosition` on ra
 
 ### Local Execution
 
-1. **Set up environment**:
+1. **Set up environment** (export the variables from your `.env` file):
    ```bash
-   cp .env.example .env
-   # Edit .env with your configuration
+   set -a; source .env; set +a
    ```
 
 2. **Run the application**:
@@ -305,59 +328,108 @@ If a transaction fails, the error is logged and the operation is retried on the 
 
 ## Docker Deployment
 
+The image runs as an unprivileged user, UID/GID **10001**, and expects the keystore and passphrase files under **`/keys`**. Both files must be readable by UID or GID 10001. For volumes created for older images, see [Upgrading from 0.0.7 or Earlier](#upgrading-from-007-or-earlier).
+
 ### Building the Docker Image
 
 ```bash
 docker build -t livepeer-funds-transfer:latest .
 ```
 
+`.dockerignore` is an allow-list: only `Cargo.toml`, `Cargo.lock` and `src/` are sent to the build, so keys, `.env` files and deployment stacks never reach it.
+
 ### Running with Docker
 
+With `JSON_KEY_FILE=/keys/keystore.json` and `PASSPHRASE_FILE=/keys/passphrase.txt` in `.env`:
+
 ```bash
+# One time: let the container user read the key files
+sudo chown -R 10001:10001 /path/to/keys
+sudo chmod 700 /path/to/keys && sudo chmod 600 /path/to/keys/*
+
 docker run -d \
   --name livepeer-funds-transfer \
   --env-file .env \
-  -v /path/to/keystore:/root/keystore \
-  -v /path/to/passphrase.txt:/root/passphrase.txt \
+  --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+  -v /path/to/keys:/keys:ro \
   livepeer-funds-transfer:latest
 ```
 
+The app writes nothing to disk, so a read-only root filesystem, no Linux capabilities and a read-only key mount all work.
+
 ### Docker Compose
 
-Create a `docker-compose.yml`:
+`docker-compose.yml` in this repo is a complete example. The parts that matter:
 
 ```yaml
-version: '3.8'
-
 services:
   funds-transfer:
-    build: .
-    container_name: livepeer-funds-transfer
+    image: tztcloud/livepeer-funds-transfer:0.0.9
     restart: unless-stopped
-    env_file:
-      - .env
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      JSON_KEY_FILE: "/keys/orchestrator_keystore.json"
+      PASSPHRASE_FILE: "/keys/orchestrator_passphrase.txt"
+      # ...the rest of the configuration
     volumes:
-      - ./keystore:/root/keystore:ro
-      - ./passphrase.txt:/root/passphrase.txt:ro
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - lpData:/keys:ro
+volumes:
+  lpData:
+    external: true
 ```
 
 Run with:
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
-### Multi-Stage Build Benefits
+### Upgrading from 0.0.7 or Earlier
+
+Images up to 0.0.7 ran as root, and stacks mounted the key volume at `/root/keys`. From 0.0.8 the app runs as UID 10001, which cannot enter `/root` or read root-only (`600`) files. An unchanged stack stops at startup, before any RPC call or transaction:
+
+```
+Error: Wallet("failed to read PASSPHRASE_FILE=/root/keys/eth-secret.txt: Permission denied (os error 13)")
+```
+
+With `restart: unless-stopped` the container then restart-loops. To upgrade:
+
+1. **Let UID/GID 10001 read the two files in the existing volume.** This is a one-time change. Root stays the owner, so anything else that uses the volume is unaffected, and it is safe to run while the old root container is still running.
+   ```bash
+   docker run --rm -v <volume>:/v debian:trixie-slim sh -c \
+     'chgrp 10001 /v /v/key.json /v/eth-secret.txt && chmod g+x /v && chmod g+r /v/key.json /v/eth-secret.txt'
+   ```
+   Use your own file names. If only this app uses the volume, `chown -R 10001:10001 /v` works too.
+2. **Mount the volume at `/keys`, read-only, and point the paths there:**
+   ```yaml
+   volumes:
+     - <volume>:/keys:ro
+   environment:
+     - JSON_KEY_FILE=/keys/key.json
+     - PASSPHRASE_FILE=/keys/eth-secret.txt
+   ```
+3. **Optionally harden the service** with `read_only: true`, `cap_drop: [ALL]` and `security_opt: ["no-new-privileges:true"]`.
+
+Stacks written for 0.0.1–0.0.2 also use older variable names. Rename them; the app does not read the old ones and stops at startup naming the first missing variable:
+
+| Old name | Current name |
+|---|---|
+| `RPC_ENDPOINT_URL` | `HTTP_RPC_URL` |
+| `ORCH_ETH_ADDR` | `ORCHESTRATOR_ADDR` (optional) |
+| `TRANSFER_BOND_RECIPIENT_ETH_ADDR` | `LPT_RECEIVER_ADDR` |
+| `ETH_FEE_RECIPIENT_ETH_ADDR` | `ETH_FEE_RECEIVER_ADDR` |
+| `LPT_RESERVE_AMOUNT` (LPT, e.g. `1125.0`) | `LPT_MIN_RETAIN_WEI` (wei, e.g. `1125000000000000000000`) |
+
+The current version also requires `ROUNDS_MANAGER_ADDR`, `BONDING_MANAGER_ADDR` and `ETH_FEE_WITHDRAW_THRESHOLD_WEI`; see [Environment Variables](#environment-variables).
+
+### Image Build
 
 The Dockerfile uses a multi-stage build:
-1. **Builder stage**: Compiles the Rust application with all dependencies
-2. **Runtime stage**: Creates minimal Debian-based image with only the binary
+1. **Builder stage** (`rust:1.97.1-trixie`): `cargo install --locked` builds exactly the dependency versions in `Cargo.lock`
+2. **Runtime stage** (`debian:trixie-slim`): only the binary, `ca-certificates` (TLS to the RPC is verified against the OS trust store) and the unprivileged `app` user
 
-This reduces the final image size significantly (from ~2GB to ~100MB).
+Both stages are pinned to Debian 13 (trixie), so the runtime's glibc matches the one the binary was built against. The runtime image is about 95 MB.
 
 ## Operations
 
@@ -462,6 +534,7 @@ stays at ~490–550k regardless of position.
 ### Operational Security
 
 1. **Minimum Privilege**:
+   - The Docker image runs as UID 10001, not root, and works with a read-only filesystem, no capabilities and a read-only key mount (see [Docker Deployment](#docker-deployment))
    - Run the application with minimal necessary permissions
    - Use dedicated service accounts
    - Implement principle of least privilege
@@ -494,12 +567,17 @@ export HTTP_RPC_URL=https://arb1.arbitrum.io/rpc
 # Or add to .env file
 ```
 
-#### 2. "could not load wallet with key and passphrase provided"
-**Cause**: Incorrect passphrase or corrupted keystore
-**Solution**: 
-- Verify passphrase file contains correct passphrase (no trailing newlines)
-- Ensure keystore file is valid JSON
-- Check file permissions
+#### 2. "failed to read PASSPHRASE_FILE=…" or "failed to decrypt JSON_KEY_FILE=…"
+The message names the path the app tried.
+
+**"No such file or directory"**: nothing is at that path inside the container.
+- Check `JSON_KEY_FILE` / `PASSPHRASE_FILE` point under the mount point, e.g. `/keys/key.json`
+- Check the volume line uses a colon: `- <volume>:/keys:ro`. With a comma (`/keys,ro`) Docker mounts the volume at a directory literally named `/keys,ro`, and `/keys` stays empty
+- An unset `${PASSPHRASE_FILE}` in a compose file becomes an empty string; the app rejects that at startup with "must not be empty"
+
+**"Permission denied"**: see [#6](#6-failed-to-read-passphrase_file-permission-denied-os-error-13).
+
+**Decrypt errors** (for example a MAC mismatch): the passphrase does not match the keystore, or the keystore is corrupted. A trailing newline in the passphrase file is ignored.
 
 #### 3. "Transfer Bond Transaction failed"
 **Causes**:
@@ -520,14 +598,30 @@ export HTTP_RPC_URL=https://arb1.arbitrum.io/rpc
 - Upgrade to a version that prices fees from the base fee (`MAX_FEE_BASE_MULTIPLIER`)
 - Keep a small ETH buffer on the orchestrator wallet for gas
 
-#### 5. Connection timeouts
+#### 5. Panic at startup: "No CA certificates were loaded from the system"
+**Cause**: The HTTP client verifies the RPC's TLS certificate against the operating system's
+trust store, and none is installed (for example a custom image built `FROM debian` without
+`ca-certificates`). The binary panics before the first RPC call, so a container with
+`restart: unless-stopped` restart-loops.
+**Solution**: Install `ca-certificates` in the runtime image, as the provided Dockerfile does.
+
+#### 6. "failed to read PASSPHRASE_FILE=…: Permission denied (os error 13)"
+**Cause**: The container runs as UID 10001 and cannot read the key files: they are root-only, or mounted under `/root` (for example a stack written for a root image).
+**Solution**: Grant UID/GID 10001 read access and mount the files at `/keys`; see [Upgrading from 0.0.7 or Earlier](#upgrading-from-007-or-earlier).
+
+#### 7. "refusing to start: authorization missing"
+**Cause**: `ENABLE_TRANSFER_BOND=true`, and `LPT_RECEIVER_ADDR` has not authorized the signer as a third-party bonder. Once Livepeer enforces the authorization, every `transferBond` would fail, so the app stops at startup instead. No rewards are called while it is down.
+**Solution**: From the receiver's wallet, call `setThirdPartyBonderAuthorization(<signer>, true)` on the BondingManager, then restart; see [Third-Party Bonder Authorization](#third-party-bonder-authorization). To keep rewards and fee withdrawals running in the meantime, set `ENABLE_TRANSFER_BOND=false`.
+If the message is instead `isThirdPartyBonderAuthorized() failed`, the check could not reach the contract: see [Connection timeouts](#8-connection-timeouts).
+
+#### 8. Connection timeouts
 **Cause**: RPC endpoint unreachable or rate limited
 **Solution**:
 - Try alternative RPC endpoint
 - Use authenticated/paid RPC service
 - Increase timeout values (requires code modification)
 
-#### 5. "Current Round is not locked"
+#### 9. "Current Round is not locked"
 **Cause**: Normal operation - rounds are not always locked
 **Solution**: Wait for next round lock (rounds lock periodically in Livepeer protocol)
 

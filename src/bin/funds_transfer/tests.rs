@@ -1,25 +1,23 @@
-//! Tests for the main-loop actions against a scripted JSON-RPC provider.
+//! Tests for the main-loop actions against a scripted JSON-RPC transport.
 //!
-//! `MockProvider` pops responses from the back of its queue and records requests in order, so
-//! [`script`] pushes responses in reverse call order and [`expect_call`] and friends assert
-//! requests front to back.
+//! Every test runs on the production client stack ([`signing_provider`]: gas estimation, pending
+//! nonce, fixed chain id, local signing), so sends are checked as decoded signed transactions.
+//! [`MockRpc`] queues responses per RPC method and records requests in order; the `expect_*`
+//! helpers assert requests front to back.
 
-use std::{sync::Arc, time::Duration};
-
-use ethers::{
-    abi::{Token, encode},
-    providers::{JsonRpcError, MockProvider, MockResponse},
-    types::{Block, Bytes, Transaction, TransactionReceipt, U64},
-    utils::{keccak256, serialize},
+use alloy::{
+    consensus::{Transaction, TxEnvelope, transaction::SignerRecoverable},
+    primitives::{Bytes, TxKind, keccak256},
+    providers::DynProvider,
+    rpc::types::TransactionRequest,
+    sol_types::SolValue,
 };
 use proptest::prelude::*;
-use serde::Serialize;
 
 use livepeer_funds_transfer::contracts::{Controller, Minter};
 
 use super::*;
-
-type Client = Provider<MockProvider>;
+use crate::mock_rpc::MockRpc;
 
 const ROUNDS: u64 = 0xa0;
 const BONDING: u64 = 0xb0;
@@ -28,31 +26,39 @@ const LPT_RECEIVER: u64 = 0x02;
 const ETH_RECEIVER: u64 = 0x03;
 const HEAD: u64 = 0x11;
 const GAS: u64 = 500_000;
+const NONCE: u64 = 7;
 const BASE_FEE: u64 = 10_000_000;
+const CHAIN_ID: u64 = 42161;
 
 fn addr(n: u64) -> Address {
-    Address::from_low_u64_be(n)
+    Address::left_padding_from(&n.to_be_bytes())
+}
+
+fn u(n: u64) -> U256 {
+    U256::from(n)
 }
 
 fn tx_hash() -> TxHash {
-    TxHash::from(keccak256("tx"))
+    keccak256("tx")
 }
 
 struct Harness {
-    client: Arc<Client>,
-    mock: MockProvider,
-    rounds: RoundsManager<Client>,
-    bonding: BondingManager<Client>,
+    mock: MockRpc,
+    signer: Address,
+    rounds: RoundsManagerInstance<DynProvider>,
+    bonding: BondingManagerInstance<DynProvider>,
 }
 
 fn harness() -> Harness {
-    let (provider, mock) = Provider::mocked();
-    // Short poll interval so PendingTransaction resolves quickly.
-    let client = Arc::new(provider.interval(Duration::from_millis(1)));
+    let mock = MockRpc::new();
+    // A fresh key per harness: the tests only need a signer to recover, never a fixed address.
+    let key = PrivateKeySigner::random();
+    let signer = key.address();
+    let provider = signing_provider(mock.client(), key, CHAIN_ID);
     Harness {
-        rounds: RoundsManager::new(addr(ROUNDS), client.clone()),
-        bonding: BondingManager::new(addr(BONDING), client.clone()),
-        client,
+        rounds: RoundsManager::new(addr(ROUNDS), provider.clone()),
+        bonding: BondingManager::new(addr(BONDING), provider),
+        signer,
         mock,
     }
 }
@@ -60,7 +66,7 @@ fn harness() -> Harness {
 fn cfg() -> Config {
     Config {
         http_rpc_url: "http://localhost:8545".into(),
-        chain_id: 42161,
+        chain_id: CHAIN_ID,
         rounds_manager_addr: addr(ROUNDS),
         bonding_manager_addr: addr(BONDING),
         json_key_file: "key.json".into(),
@@ -69,14 +75,14 @@ fn cfg() -> Config {
         loop_sleep_secs: 6,
         receipt_timeout_secs: 90,
         max_fee_base_multiplier: 2,
-        max_priority_fee_wei: U256::zero(),
+        max_priority_fee_wei: U256::ZERO,
         enable_reward: true,
         enable_transfer_bond: true,
         lpt_receiver_addr: Some(addr(LPT_RECEIVER)),
-        lpt_min_retain_wei: Some(1000.into()),
+        lpt_min_retain_wei: Some(u(1000)),
         enable_withdraw_fees: true,
         eth_fee_receiver_addr: Some(addr(ETH_RECEIVER)),
-        eth_fee_withdraw_threshold_wei: Some(2000.into()),
+        eth_fee_withdraw_threshold_wei: Some(u(2000)),
     }
 }
 
@@ -84,142 +90,97 @@ fn cfg() -> Config {
 // Responses
 // -------------------------------------------------------------------
 
-/// Pushes `responses` so they are returned in the given order.
-fn script(mock: &MockProvider, responses: Vec<MockResponse>) {
-    for r in responses.into_iter().rev() {
-        mock.push_response(r);
+impl Harness {
+    fn round_state(&self, round: u64, initialized: bool, locked: bool) {
+        self.mock.ret(u(round));
+        self.mock.ret(initialized);
+        self.mock.ret(locked);
     }
-}
 
-fn value<T: Serialize>(v: &T) -> MockResponse {
-    MockResponse::Value(serialize(v))
-}
+    /// getTranscoder() with the given lastRewardRound.
+    fn transcoder(&self, last_reward_round: u64) {
+        let mut t = [U256::ZERO; 10];
+        t[0] = u(last_reward_round);
+        self.mock.ret(t);
+    }
 
-/// ABI-encoded eth_call return data.
-fn ret(tokens: &[Token]) -> MockResponse {
-    value(&Bytes::from(encode(tokens)))
-}
+    /// A tx that is sent and mined on the first receipt poll.
+    fn mined(&self) {
+        self.mock.sendable(GAS, NONCE, tx_hash());
+        self.mock.receipt(tx_hash(), true, GAS / 2);
+    }
 
-fn uint(n: u64) -> MockResponse {
-    ret(&[Token::Uint(n.into())])
-}
+    /// A tx that is sent but has no receipt yet (use with a zero receipt timeout).
+    fn sent_not_mined(&self) {
+        self.mock.sendable(GAS, NONCE, tx_hash());
+        self.mock.no_receipt();
+    }
 
-fn boolean(b: bool) -> MockResponse {
-    ret(&[Token::Bool(b)])
-}
+    /// A tx that is sent, but polling for its receipt fails.
+    fn sent_receipt_error(&self) {
+        self.mock.sendable(GAS, NONCE, tx_hash());
+        self.mock.err("eth_getTransactionReceipt");
+    }
 
-fn rpc_error() -> MockResponse {
-    MockResponse::Error(JsonRpcError {
-        code: -32000,
-        message: "boom".into(),
-        data: None,
-    })
-}
-
-fn round_state(round: u64, initialized: bool, locked: bool) -> Vec<MockResponse> {
-    vec![uint(round), boolean(initialized), boolean(locked)]
-}
-
-/// getTranscoder() with the given lastRewardRound.
-fn transcoder(last_reward_round: u64) -> MockResponse {
-    let mut t = vec![Token::Uint(U256::zero()); 10];
-    t[0] = Token::Uint(last_reward_round.into());
-    ret(&t)
-}
-
-fn latest_block(base_fee: Option<u64>) -> MockResponse {
-    value(&Some(Block::<TxHash> {
-        number: Some(U64::from(100)),
-        base_fee_per_gas: base_fee.map(U256::from),
-        ..Default::default()
-    }))
-}
-
-/// Everything after the fee lookup for a tx that gets mined: estimateGas, send, then the
-/// PendingTransaction polls (tx, receipt).
-fn mined() -> Vec<MockResponse> {
-    vec![
-        uint_value(GAS),
-        value(&tx_hash()),
-        value(&Some(Transaction {
-            hash: tx_hash(),
-            block_number: Some(U64::from(101)),
-            ..Default::default()
-        })),
-        value(&Some(TransactionReceipt {
-            transaction_hash: tx_hash(),
-            block_number: Some(U64::from(101)),
-            status: Some(U64::from(1)),
-            gas_used: Some(U256::from(GAS / 2)),
-            ..Default::default()
-        })),
-    ]
-}
-
-/// A tx that is sent but never found: PendingTransaction gives up after 3 retries.
-fn dropped() -> Vec<MockResponse> {
-    let mut r = vec![uint_value(GAS), value(&tx_hash())];
-    r.extend((0..4).map(|_| value(&Option::<Transaction>::None)));
-    r
-}
-
-/// A tx that is sent; with a zero receipt timeout nothing is polled.
-fn sent() -> Vec<MockResponse> {
-    vec![uint_value(GAS), value(&tx_hash())]
-}
-
-/// A JSON number-as-hex response (eth_estimateGas).
-fn uint_value(n: u64) -> MockResponse {
-    value(&U256::from(n))
+    /// A tx whose gas estimate fails, so it is never signed or sent.
+    fn estimate_fails(&self) {
+        self.mock.err("eth_estimateGas");
+        // The nonce lookup runs alongside the estimate and may or may not be issued.
+        self.mock
+            .ok("eth_getTransactionCount", &format!("{NONCE:#x}"));
+    }
 }
 
 // -------------------------------------------------------------------
 // Request assertions
 // -------------------------------------------------------------------
 
-/// Asserts the next request is an eth_call of `call` at the latest block.
-fn expect_call<D>(mock: &MockProvider, call: &ContractCall<Client, D>) {
-    expect_eth_call(mock, &call.tx);
-}
-
-fn expect_eth_call(mock: &MockProvider, tx: &TypedTransaction) {
-    mock.assert_request("eth_call", [serialize(tx), serialize(&BlockNumber::Latest)])
-        .unwrap();
-}
-
-fn expect_latest_block(mock: &MockProvider) {
-    mock.assert_request(
-        "eth_getBlockByNumber",
-        [serialize(&BlockNumber::Latest), serialize(&false)],
-    )
-    .unwrap();
-}
-
-/// Asserts estimateGas then sendTransaction for `call` with the fees `with_l2_fees` sets.
-fn expect_send<D>(mock: &MockProvider, call: &ContractCall<Client, D>, max_fee: u64, tip: u64) {
-    let mut tx = call.tx.clone();
-    if let TypedTransaction::Eip1559(inner) = &mut tx {
-        inner.max_fee_per_gas = Some(max_fee.into());
-        inner.max_priority_fee_per_gas = Some(tip.into());
-    } else {
-        panic!("expected an EIP-1559 tx");
+impl Harness {
+    fn expect_round_state(&self) {
+        self.mock.expect_call(&self.rounds.currentRound());
+        self.mock
+            .expect_call(&self.rounds.currentRoundInitialized());
+        self.mock.expect_call(&self.rounds.currentRoundLocked());
     }
-    mock.assert_request("eth_estimateGas", [serialize(&tx)])
-        .unwrap();
-    tx.set_gas(GAS);
-    mock.assert_request("eth_sendTransaction", [serialize(&tx)])
-        .unwrap();
-}
 
-fn expect_no_more_requests(mock: &MockProvider) {
-    // assert_request only returns Err when the request queue is empty.
-    assert!(mock.assert_request("none", ()).is_err());
-}
+    /// Asserts the gas estimate, nonce lookup and signed send of `call` with the fees
+    /// `with_l2_fees` sets, and returns the signed tx.
+    #[track_caller]
+    fn expect_send<P: Provider, D: CallDecoder>(
+        &self,
+        call: &CallBuilder<P, D>,
+        max_fee: u128,
+        tip: u128,
+    ) -> TxEnvelope {
+        let tx = self.mock.expect_signed_send();
+        assert!(matches!(tx, TxEnvelope::Eip1559(_)), "{tx:?}");
+        assert_eq!(Some(TxKind::Call(tx.to().unwrap())), call.as_ref().to);
+        assert_eq!(tx.input(), call.calldata());
+        assert_eq!(tx.max_fee_per_gas(), max_fee);
+        assert_eq!(tx.max_priority_fee_per_gas(), Some(tip));
+        assert_eq!(tx.gas_limit(), GAS);
+        assert_eq!(tx.nonce(), NONCE);
+        assert_eq!(tx.chain_id(), Some(CHAIN_ID));
+        assert_eq!(tx.recover_signer().unwrap(), self.signer);
+        tx
+    }
 
-fn expect_round_state(h: &Harness) {
-    expect_call(&h.mock, &h.rounds.current_round());
-    expect_call(&h.mock, &h.rounds.current_round_initialized());
-    expect_call(&h.mock, &h.rounds.current_round_locked());
+    /// Asserts a failed gas estimate for `call` (and the nonce lookup, if it was issued).
+    #[track_caller]
+    fn expect_failed_estimate<P: Provider, D: CallDecoder>(&self, call: &CallBuilder<P, D>) {
+        let params = self.mock.expect("eth_estimateGas");
+        let input: Bytes = serde_json::from_value(params[0]["input"].clone()).unwrap();
+        assert_eq!(&input, call.calldata());
+        if let Some(next) = self.mock.peek_method()
+            && next == "eth_getTransactionCount"
+        {
+            self.mock.expect("eth_getTransactionCount");
+        }
+    }
+
+    fn expect_mined(&self) {
+        self.mock.expect_receipt_poll(tx_hash());
+    }
 }
 
 // -------------------------------------------------------------------
@@ -229,18 +190,18 @@ fn expect_round_state(h: &Harness) {
 #[tokio::test]
 async fn fetch_round_state_reads_all_three_flags() {
     let h = harness();
-    script(&h.mock, round_state(4371, true, false));
+    h.round_state(4371, true, false);
     let state = fetch_round_state(&h.rounds).await.unwrap();
     assert_eq!(
         state,
         RoundState {
-            round: 4371.into(),
+            round: u(4371),
             initialized: true,
             locked: false,
         }
     );
-    expect_round_state(&h);
-    expect_no_more_requests(&h.mock);
+    h.expect_round_state();
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
@@ -252,10 +213,11 @@ async fn fetch_round_state_reports_which_call_failed() {
     ];
     for (fail_at, expected) in calls.iter().enumerate() {
         let h = harness();
-        let mut responses = round_state(4371, true, true);
-        responses.truncate(fail_at);
-        responses.push(rpc_error());
-        script(&h.mock, responses);
+        let results = [u(4371).abi_encode(), true.abi_encode(), true.abi_encode()];
+        for r in &results[..fail_at] {
+            h.mock.ok("eth_call", &Bytes::from(r.clone()));
+        }
+        h.mock.err("eth_call");
 
         let err = fetch_round_state(&h.rounds).await.unwrap_err();
         assert!(matches!(err, AppError::Contract(_)), "{err}");
@@ -272,44 +234,38 @@ async fn fetch_round_state_reports_which_call_failed() {
 // with_l2_fees
 // -------------------------------------------------------------------
 
-fn fees(call: &ContractCall<Client, ()>) -> (Option<U256>, Option<U256>) {
-    match &call.tx {
-        TypedTransaction::Eip1559(inner) => (inner.max_fee_per_gas, inner.max_priority_fee_per_gas),
-        other => panic!("expected EIP-1559, got {other:?}"),
-    }
+fn fees<P, D>(call: &CallBuilder<P, D>) -> (Option<u128>, Option<u128>) {
+    let tx: &TransactionRequest = call.as_ref();
+    (tx.max_fee_per_gas, tx.max_priority_fee_per_gas)
 }
 
 #[tokio::test]
 async fn with_l2_fees_uses_base_fee_times_multiplier_plus_tip() {
     let h = harness();
-    script(&h.mock, vec![latest_block(Some(BASE_FEE))]);
+    h.mock.latest_block(Some(BASE_FEE));
     let mut cfg = cfg();
     cfg.max_fee_base_multiplier = 3;
-    cfg.max_priority_fee_wei = 7.into();
+    cfg.max_priority_fee_wei = u(7);
 
-    let call = h.bonding.reward_with_hint(addr(1), addr(2));
-    let call = with_l2_fees(h.client.as_ref(), call, &cfg).await.unwrap();
-    assert_eq!(
-        fees(&call),
-        (Some(U256::from(3 * BASE_FEE + 7)), Some(U256::from(7)))
-    );
+    let call = h.bonding.rewardWithHint(addr(1), addr(2));
+    let call = with_l2_fees(call, &cfg).await.unwrap();
+    assert_eq!(fees(&call), (Some(3 * BASE_FEE as u128 + 7), Some(7)));
     // Calldata and target are untouched.
     assert_eq!(
-        call.tx.data(),
-        h.bonding.reward_with_hint(addr(1), addr(2)).tx.data()
+        call.calldata(),
+        h.bonding.rewardWithHint(addr(1), addr(2)).calldata()
     );
-    assert_eq!(call.tx.to(), Some(&addr(BONDING).into()));
-    expect_latest_block(&h.mock);
-    expect_no_more_requests(&h.mock);
+    let tx: &TransactionRequest = call.as_ref();
+    assert_eq!(tx.to, Some(TxKind::Call(addr(BONDING))));
+    h.mock.expect_latest_block();
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn with_l2_fees_errors_without_latest_block() {
     let h = harness();
-    script(&h.mock, vec![value(&Option::<Block<TxHash>>::None)]);
-    let err = with_l2_fees(h.client.as_ref(), h.bonding.reward(), &cfg())
-        .await
-        .unwrap_err();
+    h.mock.no_block();
+    let err = with_l2_fees(h.bonding.reward(), &cfg()).await.unwrap_err();
     assert!(matches!(err, AppError::Provider(_)));
     assert_eq!(err.to_string(), "provider error: latest block not found");
 }
@@ -317,10 +273,8 @@ async fn with_l2_fees_errors_without_latest_block() {
 #[tokio::test]
 async fn with_l2_fees_errors_without_base_fee() {
     let h = harness();
-    script(&h.mock, vec![latest_block(None)]);
-    let err = with_l2_fees(h.client.as_ref(), h.bonding.reward(), &cfg())
-        .await
-        .unwrap_err();
+    h.mock.latest_block(None);
+    let err = with_l2_fees(h.bonding.reward(), &cfg()).await.unwrap_err();
     assert_eq!(
         err.to_string(),
         "provider error: latest block has no baseFeePerGas"
@@ -330,10 +284,8 @@ async fn with_l2_fees_errors_without_base_fee() {
 #[tokio::test]
 async fn with_l2_fees_reports_rpc_errors() {
     let h = harness();
-    script(&h.mock, vec![rpc_error()]);
-    let err = with_l2_fees(h.client.as_ref(), h.bonding.reward(), &cfg())
-        .await
-        .unwrap_err();
+    h.mock.err("eth_getBlockByNumber");
+    let err = with_l2_fees(h.bonding.reward(), &cfg()).await.unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.starts_with("provider error: get_block(latest) failed:"),
@@ -343,14 +295,18 @@ async fn with_l2_fees_reports_rpc_errors() {
 }
 
 #[tokio::test]
-async fn with_l2_fees_leaves_legacy_tx_untouched() {
+async fn with_l2_fees_rejects_fees_above_u128() {
     let h = harness();
-    script(&h.mock, vec![latest_block(Some(BASE_FEE))]);
-    let call = h.bonding.reward().legacy();
-    let before = call.tx.clone();
-    let call = with_l2_fees(h.client.as_ref(), call, &cfg()).await.unwrap();
-    assert_eq!(call.tx, before);
-    assert_eq!(call.tx.gas_price(), None);
+    h.mock.latest_block(Some(BASE_FEE));
+    let cfg = Config {
+        max_priority_fee_wei: U256::from(u128::MAX),
+        ..cfg()
+    };
+    let err = with_l2_fees(h.bonding.reward(), &cfg).await.unwrap_err();
+    assert!(matches!(err, AppError::Provider(_)), "{err}");
+    let msg = err.to_string();
+    assert!(msg.starts_with("provider error: maxFeePerGas "), "{msg}");
+    assert!(msg.ends_with(" exceeds u128"), "{msg}");
 }
 
 proptest! {
@@ -365,16 +321,17 @@ proptest! {
             .build()
             .unwrap();
         let h = harness();
-        script(&h.mock, vec![latest_block(Some(base_fee))]);
+        h.mock.latest_block(Some(base_fee));
         let mut cfg = cfg();
         cfg.max_fee_base_multiplier = multiplier;
-        cfg.max_priority_fee_wei = tip.into();
+        cfg.max_priority_fee_wei = u(tip);
 
         let call = rt
-            .block_on(with_l2_fees(h.client.as_ref(), h.bonding.reward(), &cfg))
+            .block_on(with_l2_fees(h.bonding.reward(), &cfg))
             .unwrap();
-        let expected = U256::from(base_fee) * U256::from(multiplier) + U256::from(tip);
-        prop_assert_eq!(fees(&call), (Some(expected), Some(U256::from(tip))));
+        // (2^64 - 1)^2 + (2^64 - 1) < 2^128, so u64 inputs always fit.
+        let expected = base_fee as u128 * multiplier as u128 + tip as u128;
+        prop_assert_eq!(fees(&call), (Some(expected), Some(tip as u128)));
     }
 }
 
@@ -386,20 +343,20 @@ proptest! {
 async fn reward_skipped_when_already_rewarded_this_round() {
     for last_reward_round in [4371, 4372] {
         let h = harness();
-        script(&h.mock, vec![transcoder(last_reward_round)]);
-        maybe_reward_once_per_round(&h.bonding, addr(ORCH), 4371.into(), &cfg())
+        h.transcoder(last_reward_round);
+        maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg())
             .await
             .unwrap();
-        expect_call(&h.mock, &h.bonding.get_transcoder(addr(ORCH)));
-        expect_no_more_requests(&h.mock);
+        h.mock.expect_call(&h.bonding.getTranscoder(addr(ORCH)));
+        h.mock.expect_no_more_requests();
     }
 }
 
 #[tokio::test]
 async fn reward_reports_get_transcoder_failure() {
     let h = harness();
-    script(&h.mock, vec![rpc_error()]);
-    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), 4371.into(), &cfg())
+    h.mock.err("eth_call");
+    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg())
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -411,138 +368,133 @@ async fn reward_reports_get_transcoder_failure() {
 
 /// Responses for compute_reward_hints on a pool `[HEAD=500, ORCH=300]`, where ORCH's reward
 /// of 225 moves it to the head. ORCH's stake was last updated in round 4300.
-fn hint_responses() -> Vec<MockResponse> {
-    let address = |a: Address| ret(&[Token::Address(a)]);
-    vec![
-        address(addr(0xc0)),
-        address(addr(0xd0)),
-        ret(&[
-            Token::Uint(4370.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-            Token::Uint(4300.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-        ]),
-        ret(&[
-            Token::Uint(250.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-            Token::Uint(0.into()),
-        ]),
-        uint(1000),
-        uint(1000),
-        ret(&[Token::Uint(U256::exp10(26))]),
-        uint(300),
-        uint(100),
-        address(addr(HEAD)),
-        uint(500),
-    ]
+fn hint_responses(h: &Harness) {
+    let m = &h.mock;
+    m.ret(addr(0xc0));
+    m.ret(addr(0xd0));
+    let mut t = [U256::ZERO; 10];
+    t[0] = u(4370);
+    t[3] = u(4300);
+    m.ret(t);
+    m.ret([u(250), U256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO]);
+    m.ret(u(1000));
+    m.ret(u(1000));
+    m.ret(U256::from(10u64).pow(u(26)));
+    m.ret(u(300));
+    m.ret(u(100));
+    m.ret(addr(HEAD));
+    m.ret(u(500));
+}
+
+/// The eth_calls compute_reward_hints makes for [`hint_responses`].
+fn expect_hint_calls(h: &Harness) {
+    let provider = h.bonding.provider();
+    let controller = Controller::new(addr(0xc0), provider);
+    let minter = Minter::new(addr(0xd0), provider);
+    let b = &h.bonding;
+    let m = &h.mock;
+    m.expect_call(&b.controller());
+    m.expect_call(&controller.getContract(keccak256("Minter")));
+    m.expect_call(&b.getTranscoder(addr(ORCH)));
+    m.expect_call(&b.getTranscoderEarningsPoolForRound(addr(ORCH), u(4300)));
+    m.expect_call(&minter.currentMintableTokens());
+    m.expect_call(&b.currentRoundTotalActiveStake());
+    m.expect_call(&b.treasuryRewardCutRate());
+    m.expect_call(&b.transcoderTotalStake(addr(ORCH)));
+    m.expect_call(&b.getTranscoderPoolMaxSize());
+    m.expect_call(&b.getFirstTranscoderInPool());
+    m.expect_call(&b.transcoderTotalStake(addr(HEAD)));
 }
 
 #[tokio::test]
 async fn reward_sends_reward_with_hint_using_computed_hints() {
     let h = harness();
-    script(
-        &h.mock,
-        [
-            vec![transcoder(4370)],
-            hint_responses(),
-            vec![latest_block(Some(BASE_FEE))],
-            mined(),
-        ]
-        .concat(),
-    );
+    h.transcoder(4370);
+    hint_responses(&h);
+    h.mock.latest_block(Some(BASE_FEE));
+    h.mined();
 
-    maybe_reward_once_per_round(&h.bonding, addr(ORCH), 4371.into(), &cfg())
+    maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg())
         .await
         .unwrap();
 
-    expect_call(&h.mock, &h.bonding.get_transcoder(addr(ORCH)));
+    h.mock.expect_call(&h.bonding.getTranscoder(addr(ORCH)));
     expect_hint_calls(&h);
-    expect_latest_block(&h.mock);
-    expect_send(
-        &h.mock,
-        &h.bonding.reward_with_hint(Address::zero(), addr(HEAD)),
-        2 * BASE_FEE,
+    h.mock.expect_latest_block();
+    h.expect_send(
+        &h.bonding.rewardWithHint(Address::ZERO, addr(HEAD)),
+        2 * BASE_FEE as u128,
         0,
     );
-    expect_mined(&h.mock);
-    expect_no_more_requests(&h.mock);
-}
-
-/// The eth_calls compute_reward_hints makes for [`hint_responses`].
-fn expect_hint_calls(h: &Harness) {
-    let controller = Controller::new(addr(0xc0), h.client.clone());
-    let minter = Minter::new(addr(0xd0), h.client.clone());
-    let b = &h.bonding;
-    expect_call(&h.mock, &b.controller());
-    expect_call(&h.mock, &controller.get_contract(keccak256("Minter")));
-    expect_call(&h.mock, &b.get_transcoder(addr(ORCH)));
-    expect_call(
-        &h.mock,
-        &b.get_transcoder_earnings_pool_for_round(addr(ORCH), 4300.into()),
-    );
-    expect_call(&h.mock, &minter.current_mintable_tokens());
-    expect_call(&h.mock, &b.current_round_total_active_stake());
-    expect_call(&h.mock, &b.treasury_reward_cut_rate());
-    expect_call(&h.mock, &b.transcoder_total_stake(addr(ORCH)));
-    expect_call(&h.mock, &b.get_transcoder_pool_max_size());
-    expect_call(&h.mock, &b.get_first_transcoder_in_pool());
-    expect_call(&h.mock, &b.transcoder_total_stake(addr(HEAD)));
-}
-
-/// The PendingTransaction polls for [`mined`].
-fn expect_mined(mock: &MockProvider) {
-    mock.assert_request("eth_getTransactionByHash", [tx_hash()])
-        .unwrap();
-    mock.assert_request("eth_getTransactionReceipt", [tx_hash()])
-        .unwrap();
+    h.expect_mined();
+    h.mock.expect_no_more_requests();
 }
 
 /// Responses for a reward that is needed, with hints failing at the first read, up to and
 /// including the fee lookup.
-fn reward_needed() -> Vec<MockResponse> {
-    vec![transcoder(4370), rpc_error(), latest_block(Some(BASE_FEE))]
+fn reward_needed(h: &Harness) {
+    h.transcoder(4370);
+    h.mock.err("eth_call");
+    h.mock.latest_block(Some(BASE_FEE));
 }
 
 #[tokio::test]
 async fn reward_falls_back_to_zero_hints_when_hints_fail() {
     let h = harness();
-    script(&h.mock, [reward_needed(), mined()].concat());
+    reward_needed(&h);
+    h.mined();
     let mut cfg = cfg();
-    cfg.max_priority_fee_wei = 5.into();
+    cfg.max_priority_fee_wei = u(5);
 
-    maybe_reward_once_per_round(&h.bonding, addr(ORCH), 4371.into(), &cfg)
+    maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg)
         .await
         .unwrap();
 
-    expect_call(&h.mock, &h.bonding.get_transcoder(addr(ORCH)));
-    expect_call(&h.mock, &h.bonding.controller());
-    expect_latest_block(&h.mock);
-    expect_send(
-        &h.mock,
-        &h.bonding.reward_with_hint(Address::zero(), Address::zero()),
-        2 * BASE_FEE + 5,
+    h.mock.expect_call(&h.bonding.getTranscoder(addr(ORCH)));
+    h.mock.expect_call(&h.bonding.controller());
+    h.mock.expect_latest_block();
+    h.expect_send(
+        &h.bonding.rewardWithHint(Address::ZERO, Address::ZERO),
+        2 * BASE_FEE as u128 + 5,
         5,
     );
-    expect_mined(&h.mock);
-    expect_no_more_requests(&h.mock);
+    h.expect_mined();
+    h.mock.expect_no_more_requests();
+}
+
+#[tokio::test]
+async fn reward_sends_signed_eip1559_tx_from_the_keystore_signer() {
+    let h = harness();
+    reward_needed(&h);
+    h.mined();
+
+    // The orchestrator is the signer, as in main() without ORCHESTRATOR_ADDR.
+    maybe_reward_once_per_round(&h.bonding, h.signer, u(4371), &cfg())
+        .await
+        .unwrap();
+
+    h.mock.expect_call(&h.bonding.getTranscoder(h.signer));
+    h.mock.expect_call(&h.bonding.controller());
+    h.mock.expect_latest_block();
+    // expect_send checks the type, fields, chain id and recovered signer.
+    let tx = h.expect_send(
+        &h.bonding.rewardWithHint(Address::ZERO, Address::ZERO),
+        2 * BASE_FEE as u128,
+        0,
+    );
+    assert_eq!(tx.to(), Some(addr(BONDING)));
+    assert_eq!(tx.value(), U256::ZERO);
+    h.expect_mined();
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn reward_fee_lookup_failure_is_returned() {
     let h = harness();
-    script(
-        &h.mock,
-        vec![transcoder(4370), rpc_error(), latest_block(None)],
-    );
-    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), 4371.into(), &cfg())
+    h.transcoder(4370);
+    h.mock.err("eth_call");
+    h.mock.latest_block(None);
+    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg())
         .await
         .unwrap_err();
     assert!(matches!(err, AppError::Provider(_)), "{err}");
@@ -551,9 +503,9 @@ async fn reward_fee_lookup_failure_is_returned() {
 #[tokio::test]
 async fn reward_send_failure_is_returned() {
     let h = harness();
-    // eth_estimateGas fails inside send().
-    script(&h.mock, [reward_needed(), vec![rpc_error()]].concat());
-    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), 4371.into(), &cfg())
+    reward_needed(&h);
+    h.estimate_fails();
+    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg())
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -561,31 +513,36 @@ async fn reward_send_failure_is_returned() {
         msg.starts_with("tx error: rewardWithHint() send failed:"),
         "{msg}"
     );
+    assert!(msg.contains("boom"), "{msg}");
 }
 
 #[tokio::test]
-async fn reward_dropped_tx_is_an_error() {
+async fn reward_receipt_error_is_an_error() {
     let h = harness();
-    script(&h.mock, [reward_needed(), dropped()].concat());
-    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), 4371.into(), &cfg())
+    reward_needed(&h);
+    h.sent_receipt_error();
+    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg())
         .await
         .unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        format!(
-            "tx error: reward tx pending returned None receipt: tx_hash={:?}",
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with(&format!(
+            "tx error: reward tx receipt error: tx_hash={:?} err=",
             tx_hash()
-        )
+        )),
+        "{msg}"
     );
+    assert!(msg.contains("boom"), "{msg}");
 }
 
 #[tokio::test]
 async fn reward_receipt_timeout_is_an_error() {
     let h = harness();
-    script(&h.mock, [reward_needed(), sent()].concat());
+    reward_needed(&h);
+    h.sent_not_mined();
     let mut cfg = cfg();
     cfg.receipt_timeout_secs = 0;
-    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), 4371.into(), &cfg)
+    let err = maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg)
         .await
         .unwrap_err();
     assert_eq!(
@@ -598,64 +555,26 @@ async fn reward_receipt_timeout_is_an_error() {
 }
 
 #[tokio::test]
-async fn reward_through_signer_middleware_sends_signed_tx() {
-    // Same client stack as main(): SignerMiddleware over a provider, with a local key.
-    let (provider, mock) = Provider::mocked();
-    let wallet = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-        .parse::<LocalWallet>()
-        .unwrap()
-        .with_chain_id(42161u64);
-    let signer = wallet.address();
-    let client = Arc::new(SignerMiddleware::new(
-        provider.interval(Duration::from_millis(1)),
-        wallet.clone(),
-    ));
-    let bonding = BondingManager::new(addr(BONDING), client);
+async fn reward_waits_until_the_receipt_appears() {
+    let h = harness();
+    reward_needed(&h);
+    h.mock.sendable(GAS, NONCE, tx_hash());
+    h.mock.no_receipt();
+    h.mock.no_receipt();
+    h.mock.receipt(tx_hash(), true, GAS / 2);
 
-    // getTranscoder, controller() fails, block, nonce, estimateGas, sendRawTransaction,
-    // then the tx/receipt polls.
-    script(
-        &mock,
-        [reward_needed(), vec![uint_value(7)], mined()].concat(),
-    );
-
-    maybe_reward_once_per_round(&bonding, signer, 4371.into(), &cfg())
+    maybe_reward_once_per_round(&h.bonding, addr(ORCH), u(4371), &cfg())
         .await
         .unwrap();
 
-    // SignerMiddleware sets `from` on calls.
-    let with_from = |mut tx: TypedTransaction| {
-        tx.set_from(signer);
-        tx
-    };
-    expect_eth_call(&mock, &with_from(bonding.get_transcoder(signer).tx));
-    expect_eth_call(&mock, &with_from(bonding.controller().tx));
-    expect_latest_block(&mock);
-    mock.assert_request(
-        "eth_getTransactionCount",
-        [serialize(&signer), serialize(&BlockNumber::Latest)],
-    )
-    .unwrap();
-
-    let mut tx = with_from(
-        bonding
-            .reward_with_hint(Address::zero(), Address::zero())
-            .tx,
-    );
-    tx.set_chain_id(42161u64);
-    tx.set_nonce(7);
-    if let TypedTransaction::Eip1559(inner) = &mut tx {
-        inner.max_fee_per_gas = Some((2 * BASE_FEE).into());
-        inner.max_priority_fee_per_gas = Some(U256::zero());
+    h.mock.expect_call(&h.bonding.getTranscoder(addr(ORCH)));
+    h.mock.expect_call(&h.bonding.controller());
+    h.mock.expect_latest_block();
+    h.mock.expect_signed_send();
+    for _ in 0..3 {
+        h.mock.expect_receipt_poll(tx_hash());
     }
-    mock.assert_request("eth_estimateGas", [serialize(&tx)])
-        .unwrap();
-    tx.set_gas(GAS);
-    let sig = wallet.sign_transaction_sync(&tx).unwrap();
-    mock.assert_request("eth_sendRawTransaction", [tx.rlp_signed(&sig)])
-        .unwrap();
-    expect_mined(&mock);
-    expect_no_more_requests(&mock);
+    h.mock.expect_no_more_requests();
 }
 
 // -------------------------------------------------------------------
@@ -667,14 +586,14 @@ async fn locked(
     cfg: &Config,
     snapshot: &mut Option<LockedSnapshot>,
 ) -> Result<(), AppError> {
-    handle_locked_round_actions(&h.bonding, addr(ORCH), 4371.into(), cfg, snapshot).await
+    handle_locked_round_actions(&h.bonding, addr(ORCH), u(4371), cfg, snapshot).await
 }
 
 fn snapshot(stake: Option<u64>, fees: Option<u64>) -> Option<LockedSnapshot> {
     Some(LockedSnapshot {
-        round: 4371.into(),
-        pending_stake: stake.unwrap_or(0).into(),
-        pending_fees: fees.unwrap_or(0).into(),
+        round: u(4371),
+        pending_stake: u(stake.unwrap_or(0)),
+        pending_fees: u(fees.unwrap_or(0)),
         stake_present: stake.is_some(),
         fees_present: fees.is_some(),
     })
@@ -694,6 +613,17 @@ fn only_withdraw_fees() -> Config {
     }
 }
 
+/// Asserts the signed transferBond of `amount` to the LPT receiver, with zero hints.
+fn expect_transfer_bond(h: &Harness, amount: u64) {
+    let zero = Address::ZERO;
+    h.expect_send(
+        &h.bonding
+            .transferBond(addr(LPT_RECEIVER), u(amount), zero, zero, zero, zero),
+        2 * BASE_FEE as u128,
+        0,
+    );
+}
+
 #[tokio::test]
 async fn locked_actions_do_nothing_when_both_disabled() {
     let h = harness();
@@ -705,7 +635,7 @@ async fn locked_actions_do_nothing_when_both_disabled() {
     let mut snap = None;
     locked(&h, &cfg, &mut snap).await.unwrap();
     assert_eq!(snap, None);
-    expect_no_more_requests(&h.mock);
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
@@ -744,7 +674,7 @@ async fn locked_actions_require_settings_for_enabled_actions() {
         let h = harness();
         let err = locked(&h, &cfg, &mut None).await.unwrap_err();
         assert!(matches!(err, AppError::BadEnv(k, _) if k == key), "{err}");
-        expect_no_more_requests(&h.mock);
+        h.mock.expect_no_more_requests();
     }
 }
 
@@ -753,76 +683,72 @@ async fn transfer_bond_skipped_when_nothing_above_retain() {
     // Below, equal to, and zero pending stake with retain = 1000.
     for pending in [999, 1000, 0] {
         let h = harness();
-        script(&h.mock, vec![uint(pending)]);
+        h.mock.ret(u(pending));
         let mut snap = None;
         locked(&h, &only_transfer_bond(), &mut snap).await.unwrap();
         assert_eq!(snap, snapshot(Some(pending), None));
-        expect_call(&h.mock, &h.bonding.pending_stake(addr(ORCH), 4371.into()));
-        expect_no_more_requests(&h.mock);
+        h.mock
+            .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
+        h.mock.expect_no_more_requests();
     }
 }
 
 #[tokio::test]
 async fn transfer_bond_sends_stake_above_retain() {
     let h = harness();
-    script(
-        &h.mock,
-        [vec![uint(1500), latest_block(Some(BASE_FEE))], mined()].concat(),
-    );
+    h.mock.ret(u(1500));
+    h.mock.latest_block(Some(BASE_FEE));
+    h.mined();
     let mut snap = None;
     locked(&h, &only_transfer_bond(), &mut snap).await.unwrap();
     assert_eq!(snap, snapshot(Some(1500), None));
 
-    expect_call(&h.mock, &h.bonding.pending_stake(addr(ORCH), 4371.into()));
-    expect_latest_block(&h.mock);
-    let zero = Address::zero();
-    expect_send(
-        &h.mock,
-        &h.bonding
-            .transfer_bond(addr(LPT_RECEIVER), 500.into(), zero, zero, zero, zero),
-        2 * BASE_FEE,
-        0,
-    );
-    expect_mined(&h.mock);
-    expect_no_more_requests(&h.mock);
+    h.mock
+        .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
+    h.mock.expect_latest_block();
+    expect_transfer_bond(&h, 500);
+    h.expect_mined();
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn transfer_bond_with_zero_retain_sends_everything() {
     let h = harness();
-    script(
-        &h.mock,
-        [vec![uint(1500), latest_block(Some(BASE_FEE))], mined()].concat(),
-    );
+    h.mock.ret(u(1500));
+    h.mock.latest_block(Some(BASE_FEE));
+    h.mined();
     let cfg = Config {
-        lpt_min_retain_wei: Some(U256::zero()),
+        lpt_min_retain_wei: Some(U256::ZERO),
         ..only_transfer_bond()
     };
     locked(&h, &cfg, &mut None).await.unwrap();
 
-    expect_call(&h.mock, &h.bonding.pending_stake(addr(ORCH), 4371.into()));
-    expect_latest_block(&h.mock);
-    let zero = Address::zero();
-    expect_send(
-        &h.mock,
-        &h.bonding
-            .transfer_bond(addr(LPT_RECEIVER), 1500.into(), zero, zero, zero, zero),
-        2 * BASE_FEE,
-        0,
-    );
+    h.mock
+        .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
+    h.mock.expect_latest_block();
+    expect_transfer_bond(&h, 1500);
+}
+
+/// Scripts a tx that goes wrong after the fee lookup.
+type TxProblem = fn(&Harness);
+
+/// Send failure, receipt poll error, receipt timeout (each with its receipt timeout): all end
+/// in Ok with the snapshot updated.
+fn tx_problem_cases() -> [(TxProblem, u64); 3] {
+    [
+        (Harness::estimate_fails, 90),
+        (Harness::sent_receipt_error, 90),
+        (Harness::sent_not_mined, 0),
+    ]
 }
 
 #[tokio::test]
 async fn transfer_bond_tx_problems_are_logged_not_returned() {
-    // Send failure, dropped tx, receipt timeout: all end in Ok with the snapshot updated.
-    let cases: [(Vec<MockResponse>, u64); 3] =
-        [(vec![rpc_error()], 90), (dropped(), 90), (sent(), 0)];
-    for (tx_responses, receipt_timeout_secs) in cases {
+    for (tx_problem, receipt_timeout_secs) in tx_problem_cases() {
         let h = harness();
-        script(
-            &h.mock,
-            [vec![uint(1500), latest_block(Some(BASE_FEE))], tx_responses].concat(),
-        );
+        h.mock.ret(u(1500));
+        h.mock.latest_block(Some(BASE_FEE));
+        tx_problem(&h);
         let cfg = Config {
             receipt_timeout_secs,
             ..only_transfer_bond()
@@ -836,66 +762,93 @@ async fn transfer_bond_tx_problems_are_logged_not_returned() {
 #[tokio::test]
 async fn transfer_bond_send_failure_still_withdraws_fees() {
     let h = harness();
-    script(
-        &h.mock,
-        [
-            vec![uint(1500), latest_block(Some(BASE_FEE)), rpc_error()],
-            vec![uint(3000), latest_block(Some(BASE_FEE))],
-            mined(),
-        ]
-        .concat(),
-    );
+    // pendingStake, then pendingFees.
+    h.mock.ret(u(1500));
+    h.mock.ret(u(3000));
+    h.mock.latest_block(Some(BASE_FEE));
+    h.mock.latest_block(Some(BASE_FEE));
+    // transferBond's estimate fails; withdrawFees is mined.
+    h.mock.err("eth_estimateGas");
+    h.mined();
     let mut snap = None;
     locked(&h, &cfg(), &mut snap).await.unwrap();
     assert_eq!(snap, snapshot(Some(1500), Some(3000)));
 
-    expect_call(&h.mock, &h.bonding.pending_stake(addr(ORCH), 4371.into()));
-    expect_latest_block(&h.mock);
-    let mut failed = h.bonding.transfer_bond(
-        addr(LPT_RECEIVER),
-        500.into(),
-        Address::zero(),
-        Address::zero(),
-        Address::zero(),
-        Address::zero(),
-    );
-    if let TypedTransaction::Eip1559(inner) = &mut failed.tx {
-        inner.max_fee_per_gas = Some((2 * BASE_FEE).into());
-        inner.max_priority_fee_per_gas = Some(U256::zero());
-    }
     h.mock
-        .assert_request("eth_estimateGas", [serialize(&failed.tx)])
-        .unwrap();
-    expect_call(&h.mock, &h.bonding.pending_fees(addr(ORCH), 4371.into()));
-    expect_latest_block(&h.mock);
-    expect_send(
-        &h.mock,
-        &h.bonding.withdraw_fees(addr(ETH_RECEIVER), 3000.into()),
-        2 * BASE_FEE,
+        .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
+    h.mock.expect_latest_block();
+    let zero = Address::ZERO;
+    h.expect_failed_estimate(&h.bonding.transferBond(
+        addr(LPT_RECEIVER),
+        u(500),
+        zero,
+        zero,
+        zero,
+        zero,
+    ));
+    h.mock
+        .expect_call(&h.bonding.pendingFees(addr(ORCH), u(4371)));
+    h.mock.expect_latest_block();
+    h.expect_send(
+        &h.bonding.withdrawFees(addr(ETH_RECEIVER), u(3000)),
+        2 * BASE_FEE as u128,
         0,
     );
-    expect_mined(&h.mock);
-    expect_no_more_requests(&h.mock);
+    h.expect_mined();
+    h.mock.expect_no_more_requests();
+}
+
+#[tokio::test]
+async fn every_send_uses_the_nodes_pending_nonce() {
+    // The node still reports nonce 7 after the first send (say it never landed). The second tx
+    // must reuse 7; a locally cached nonce would sign 8 and leave a gap that stalls every tx.
+    let h = harness();
+    h.mock.ret(u(1500));
+    h.mock.ret(u(3000));
+    h.mock.latest_block(Some(BASE_FEE));
+    h.mock.latest_block(Some(BASE_FEE));
+    h.mined();
+    h.mined();
+    locked(&h, &cfg(), &mut None).await.unwrap();
+
+    h.mock
+        .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
+    h.mock.expect_latest_block();
+    expect_transfer_bond(&h, 500);
+    h.expect_mined();
+    h.mock
+        .expect_call(&h.bonding.pendingFees(addr(ORCH), u(4371)));
+    h.mock.expect_latest_block();
+    // expect_send asserts the nonce lookup was made and nonce == NONCE.
+    h.expect_send(
+        &h.bonding.withdrawFees(addr(ETH_RECEIVER), u(3000)),
+        2 * BASE_FEE as u128,
+        0,
+    );
+    h.expect_mined();
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn transfer_bond_fee_lookup_failure_aborts_locked_actions() {
     let h = harness();
-    script(&h.mock, vec![uint(1500), latest_block(None)]);
+    h.mock.ret(u(1500));
+    h.mock.latest_block(None);
     let mut snap = None;
     let err = locked(&h, &cfg(), &mut snap).await.unwrap_err();
     assert!(matches!(err, AppError::Provider(_)), "{err}");
     // withdrawFees is not attempted and the snapshot is not updated.
     assert_eq!(snap, None);
-    expect_call(&h.mock, &h.bonding.pending_stake(addr(ORCH), 4371.into()));
-    expect_latest_block(&h.mock);
-    expect_no_more_requests(&h.mock);
+    h.mock
+        .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
+    h.mock.expect_latest_block();
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn pending_stake_failure_is_returned() {
     let h = harness();
-    script(&h.mock, vec![rpc_error()]);
+    h.mock.err("eth_call");
     let err = locked(&h, &cfg(), &mut None).await.unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -907,7 +860,8 @@ async fn pending_stake_failure_is_returned() {
 #[tokio::test]
 async fn pending_fees_failure_is_returned() {
     let h = harness();
-    script(&h.mock, vec![uint(0), rpc_error()]);
+    h.mock.ret(U256::ZERO);
+    h.mock.err("eth_call");
     let mut snap = None;
     let err = locked(&h, &cfg(), &mut snap).await.unwrap_err();
     let msg = err.to_string();
@@ -921,60 +875,58 @@ async fn pending_fees_failure_is_returned() {
 #[tokio::test]
 async fn withdraw_fees_skipped_below_threshold() {
     let h = harness();
-    script(&h.mock, vec![uint(1999)]);
+    h.mock.ret(u(1999));
     let mut snap = None;
     locked(&h, &only_withdraw_fees(), &mut snap).await.unwrap();
     assert_eq!(snap, snapshot(None, Some(1999)));
-    expect_call(&h.mock, &h.bonding.pending_fees(addr(ORCH), 4371.into()));
-    expect_no_more_requests(&h.mock);
+    h.mock
+        .expect_call(&h.bonding.pendingFees(addr(ORCH), u(4371)));
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn withdraw_fees_skipped_when_zero_even_with_zero_threshold() {
     let h = harness();
-    script(&h.mock, vec![uint(0)]);
+    h.mock.ret(U256::ZERO);
     let cfg = Config {
-        eth_fee_withdraw_threshold_wei: Some(U256::zero()),
+        eth_fee_withdraw_threshold_wei: Some(U256::ZERO),
         ..only_withdraw_fees()
     };
     locked(&h, &cfg, &mut None).await.unwrap();
-    expect_call(&h.mock, &h.bonding.pending_fees(addr(ORCH), 4371.into()));
-    expect_no_more_requests(&h.mock);
+    h.mock
+        .expect_call(&h.bonding.pendingFees(addr(ORCH), u(4371)));
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn withdraw_fees_sends_all_pending_fees_at_threshold() {
     let h = harness();
-    script(
-        &h.mock,
-        [vec![uint(2000), latest_block(Some(BASE_FEE))], mined()].concat(),
-    );
+    h.mock.ret(u(2000));
+    h.mock.latest_block(Some(BASE_FEE));
+    h.mined();
     let mut snap = None;
     locked(&h, &only_withdraw_fees(), &mut snap).await.unwrap();
     assert_eq!(snap, snapshot(None, Some(2000)));
 
-    expect_call(&h.mock, &h.bonding.pending_fees(addr(ORCH), 4371.into()));
-    expect_latest_block(&h.mock);
-    expect_send(
-        &h.mock,
-        &h.bonding.withdraw_fees(addr(ETH_RECEIVER), 2000.into()),
-        2 * BASE_FEE,
+    h.mock
+        .expect_call(&h.bonding.pendingFees(addr(ORCH), u(4371)));
+    h.mock.expect_latest_block();
+    h.expect_send(
+        &h.bonding.withdrawFees(addr(ETH_RECEIVER), u(2000)),
+        2 * BASE_FEE as u128,
         0,
     );
-    expect_mined(&h.mock);
-    expect_no_more_requests(&h.mock);
+    h.expect_mined();
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn withdraw_fees_tx_problems_are_logged_not_returned() {
-    let cases: [(Vec<MockResponse>, u64); 3] =
-        [(vec![rpc_error()], 90), (dropped(), 90), (sent(), 0)];
-    for (tx_responses, receipt_timeout_secs) in cases {
+    for (tx_problem, receipt_timeout_secs) in tx_problem_cases() {
         let h = harness();
-        script(
-            &h.mock,
-            [vec![uint(5000), latest_block(Some(BASE_FEE))], tx_responses].concat(),
-        );
+        h.mock.ret(u(5000));
+        h.mock.latest_block(Some(BASE_FEE));
+        tx_problem(&h);
         let cfg = Config {
             receipt_timeout_secs,
             ..only_withdraw_fees()
@@ -988,7 +940,8 @@ async fn withdraw_fees_tx_problems_are_logged_not_returned() {
 #[tokio::test]
 async fn withdraw_fees_fee_lookup_failure_is_returned() {
     let h = harness();
-    script(&h.mock, vec![uint(5000), latest_block(None)]);
+    h.mock.ret(u(5000));
+    h.mock.latest_block(None);
     let err = locked(&h, &only_withdraw_fees(), &mut None)
         .await
         .unwrap_err();
@@ -999,10 +952,9 @@ async fn withdraw_fees_fee_lookup_failure_is_returned() {
 async fn locked_snapshot_tracks_changes() {
     let h = harness();
     // Same values twice, then fees change.
-    script(
-        &h.mock,
-        vec![uint(10), uint(20), uint(10), uint(20), uint(10), uint(30)],
-    );
+    for v in [10, 20, 10, 20, 10, 30] {
+        h.mock.ret(u(v));
+    }
     let mut snap = snapshot(Some(1), None);
     locked(&h, &cfg(), &mut snap).await.unwrap();
     assert_eq!(snap, snapshot(Some(10), Some(20)));
@@ -1027,7 +979,7 @@ async fn poll(
 
 fn state(round: u64, initialized: bool, locked: bool) -> Option<RoundState> {
     Some(RoundState {
-        round: round.into(),
+        round: u(round),
         initialized,
         locked,
     })
@@ -1036,29 +988,27 @@ fn state(round: u64, initialized: bool, locked: bool) -> Option<RoundState> {
 #[tokio::test]
 async fn poll_keeps_last_state_when_round_state_fetch_fails() {
     let h = harness();
-    script(&h.mock, vec![rpc_error()]);
+    h.mock.err("eth_call");
     let mut last = state(4370, true, true);
     poll(&h, &cfg(), &mut last, &mut None).await;
     assert_eq!(last, state(4370, true, true));
-    expect_call(&h.mock, &h.rounds.current_round());
-    expect_no_more_requests(&h.mock);
+    h.mock.expect_call(&h.rounds.currentRound());
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn poll_checks_reward_when_initialized() {
     let h = harness();
-    script(
-        &h.mock,
-        [round_state(4371, true, false), vec![transcoder(4371)]].concat(),
-    );
+    h.round_state(4371, true, false);
+    h.transcoder(4371);
     let mut last = None;
     let mut snap = None;
     poll(&h, &cfg(), &mut last, &mut snap).await;
     assert_eq!(last, state(4371, true, false));
     assert_eq!(snap, None);
-    expect_round_state(&h);
-    expect_call(&h.mock, &h.bonding.get_transcoder(addr(ORCH)));
-    expect_no_more_requests(&h.mock);
+    h.expect_round_state();
+    h.mock.expect_call(&h.bonding.getTranscoder(addr(ORCH)));
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
@@ -1075,12 +1025,12 @@ async fn poll_skips_reward_when_disabled_or_not_initialized() {
     ];
     for (cfg, initialized) in cases {
         let h = harness();
-        script(&h.mock, round_state(4371, initialized, false));
+        h.round_state(4371, initialized, false);
         let mut last = state(4371, initialized, false);
         poll(&h, &cfg, &mut last, &mut None).await;
         assert_eq!(last, state(4371, initialized, false));
-        expect_round_state(&h);
-        expect_no_more_requests(&h.mock);
+        h.expect_round_state();
+        h.mock.expect_no_more_requests();
     }
 }
 
@@ -1088,30 +1038,28 @@ async fn poll_skips_reward_when_disabled_or_not_initialized() {
 async fn poll_runs_locked_actions_when_locked() {
     let h = harness();
     // Initialized and locked: reward check first, then both locked-round reads.
-    script(
-        &h.mock,
-        [
-            round_state(4371, true, true),
-            vec![transcoder(4371), uint(0), uint(0)],
-        ]
-        .concat(),
-    );
+    h.round_state(4371, true, true);
+    h.transcoder(4371);
+    h.mock.ret(U256::ZERO);
+    h.mock.ret(U256::ZERO);
     let mut last = state(4371, true, false);
     let mut snap = None;
     poll(&h, &cfg(), &mut last, &mut snap).await;
     assert_eq!(last, state(4371, true, true));
     assert_eq!(snap, snapshot(Some(0), Some(0)));
-    expect_round_state(&h);
-    expect_call(&h.mock, &h.bonding.get_transcoder(addr(ORCH)));
-    expect_call(&h.mock, &h.bonding.pending_stake(addr(ORCH), 4371.into()));
-    expect_call(&h.mock, &h.bonding.pending_fees(addr(ORCH), 4371.into()));
-    expect_no_more_requests(&h.mock);
+    h.expect_round_state();
+    h.mock.expect_call(&h.bonding.getTranscoder(addr(ORCH)));
+    h.mock
+        .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
+    h.mock
+        .expect_call(&h.bonding.pendingFees(addr(ORCH), u(4371)));
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn poll_skips_locked_actions_when_disabled() {
     let h = harness();
-    script(&h.mock, round_state(4371, false, true));
+    h.round_state(4371, false, true);
     let cfg = Config {
         enable_transfer_bond: false,
         enable_withdraw_fees: false,
@@ -1120,29 +1068,147 @@ async fn poll_skips_locked_actions_when_disabled() {
     let mut snap = None;
     poll(&h, &cfg, &mut None, &mut snap).await;
     assert_eq!(snap, None);
-    expect_round_state(&h);
-    expect_no_more_requests(&h.mock);
+    h.expect_round_state();
+    h.mock.expect_no_more_requests();
 }
 
 #[tokio::test]
 async fn poll_logs_action_errors_and_still_records_state() {
     let h = harness();
     // getTranscoder fails, pendingStake fails.
-    script(
-        &h.mock,
-        [
-            round_state(4371, true, true),
-            vec![rpc_error(), rpc_error()],
-        ]
-        .concat(),
-    );
+    h.round_state(4371, true, true);
+    h.mock.err("eth_call");
+    h.mock.err("eth_call");
     let mut last = None;
     let mut snap = None;
     poll(&h, &cfg(), &mut last, &mut snap).await;
     assert_eq!(last, state(4371, true, true));
     assert_eq!(snap, None);
-    expect_round_state(&h);
-    expect_call(&h.mock, &h.bonding.get_transcoder(addr(ORCH)));
-    expect_call(&h.mock, &h.bonding.pending_stake(addr(ORCH), 4371.into()));
-    expect_no_more_requests(&h.mock);
+    h.expect_round_state();
+    h.mock.expect_call(&h.bonding.getTranscoder(addr(ORCH)));
+    h.mock
+        .expect_call(&h.bonding.pendingStake(addr(ORCH), u(4371)));
+    h.mock.expect_no_more_requests();
+}
+
+// -------------------------------------------------------------------
+// check_transfer_bond_authorization
+// -------------------------------------------------------------------
+
+/// The receiver is the delegator; the signer (the transferBond sender) is the bonder.
+fn expect_authorization_call(h: &Harness) {
+    h.mock.expect_call(
+        &h.bonding
+            .isThirdPartyBonderAuthorized(addr(LPT_RECEIVER), h.signer),
+    );
+    h.mock.expect_no_more_requests();
+}
+
+#[tokio::test]
+async fn authorization_check_passes_when_receiver_authorized_signer() {
+    let h = harness();
+    h.mock.ret(true);
+    let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg()).await;
+    assert_eq!(got.unwrap(), BondAuthorization::Authorized);
+    expect_authorization_call(&h);
+}
+
+#[tokio::test]
+async fn missing_authorization_refuses_to_start_and_says_how_to_fix_it() {
+    let h = harness();
+    h.mock.ret(false);
+    let err = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg())
+        .await
+        .unwrap_err();
+    let AppError::Unauthorized(msg) = &err else {
+        panic!("expected Unauthorized, got {err:?}");
+    };
+    let fix = format!("setThirdPartyBonderAuthorization({:?}, true)", h.signer);
+    let receiver = format!("LPT_RECEIVER_ADDR={:?}", addr(LPT_RECEIVER));
+    let bonding = format!("BondingManager {:?}", addr(BONDING));
+    for part in [&fix, &receiver, &bonding, "ENABLE_TRANSFER_BOND=false"] {
+        assert!(msg.contains(part), "{part:?} not in {msg}");
+    }
+    expect_authorization_call(&h);
+}
+
+#[tokio::test]
+async fn failed_authorization_check_refuses_to_start() {
+    let h = harness();
+    h.mock.err("eth_call");
+    let err = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg())
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("contract error: isThirdPartyBonderAuthorized() failed:"),
+        "{msg}"
+    );
+    assert!(msg.contains("ENABLE_TRANSFER_BOND=false"), "{msg}");
+    expect_authorization_call(&h);
+}
+
+#[tokio::test]
+async fn authorization_not_checked_without_a_third_party_transfer() {
+    let h = harness();
+    let disabled = Config {
+        enable_transfer_bond: false,
+        ..cfg()
+    };
+    let to_self = Config {
+        lpt_receiver_addr: Some(h.signer),
+        ..cfg()
+    };
+    for cfg in [disabled, to_self] {
+        let got = check_transfer_bond_authorization(&h.bonding, h.signer, &cfg).await;
+        assert_eq!(got.unwrap(), BondAuthorization::NotNeeded);
+    }
+    h.mock.expect_no_more_requests();
+}
+
+// -------------------------------------------------------------------
+// load_signer
+// -------------------------------------------------------------------
+
+/// A config whose key files live under a fresh, empty temp directory.
+fn key_files_in(dir: &std::path::Path) -> Config {
+    Config {
+        json_key_file: dir.join("key.json").display().to_string(),
+        passphrase_file: dir.join("eth-secret.txt").display().to_string(),
+        ..cfg()
+    }
+}
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("funds-transfer-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn missing_passphrase_file_error_names_the_path() {
+    let dir = temp_dir("no-pass");
+    let cfg = key_files_in(&dir);
+    let msg = load_signer(&cfg).unwrap_err().to_string();
+    let expected = format!(
+        "wallet error: failed to read PASSPHRASE_FILE={}: ",
+        cfg.passphrase_file
+    );
+    assert!(msg.starts_with(&expected), "{msg}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn missing_keystore_error_names_the_path() {
+    let dir = temp_dir("no-key");
+    let cfg = key_files_in(&dir);
+    std::fs::write(&cfg.passphrase_file, "pass\n").unwrap();
+    let msg = load_signer(&cfg).unwrap_err().to_string();
+    let expected = format!(
+        "wallet error: failed to decrypt JSON_KEY_FILE={}: ",
+        cfg.json_key_file
+    );
+    assert!(msg.starts_with(&expected), "{msg}");
+    std::fs::remove_dir_all(dir).unwrap();
 }
